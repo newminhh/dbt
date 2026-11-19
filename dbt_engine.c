@@ -59,21 +59,47 @@ static uint8_t *g_segv_tramp_page = NULL;
 static __thread newminhh_cpu_t tls_cpu;
 static __thread uint32_t tls_stack_base = 0;
 static __thread uint32_t tls_stack_size = 0;
+static __thread uint32_t tls_gs_alloc_base = 0;
+static __thread uint32_t tls_gs_alloc_size = 0;
 static __thread int tls_stack_key_set = 0;
 static pthread_key_t g_tls_stack_key;
 
 typedef struct {
     uint32_t base;
     uint32_t size;
+    uint32_t gs_alloc_base;
+    uint32_t gs_alloc_size;
 } tls_stack_cleanup_t;
+
+static __thread tls_stack_cleanup_t *tls_cleanup_rec = NULL;
 
 static void tls_stack_destructor(void *ptr) {
     tls_stack_cleanup_t *c = (tls_stack_cleanup_t *)ptr;
     if (c) {
+        if (c->gs_alloc_base && c->gs_alloc_size) {
+            syscall(__NR_arch_prctl, ARCH_SET_GS, 0UL);
+            munmap((void *)(uintptr_t)c->gs_alloc_base, c->gs_alloc_size);
+        }
         if (c->base && c->size) {
             munmap((void *)(uintptr_t)c->base, c->size);
         }
         free(c);
+    }
+}
+
+static void register_tls_cleanup_if_needed(void) {
+    if (!tls_cleanup_rec) {
+        tls_cleanup_rec = (tls_stack_cleanup_t *)calloc(1, sizeof(*tls_cleanup_rec));
+    }
+    if (tls_cleanup_rec) {
+        tls_cleanup_rec->base = tls_stack_base;
+        tls_cleanup_rec->size = tls_stack_size;
+        tls_cleanup_rec->gs_alloc_base = tls_gs_alloc_base;
+        tls_cleanup_rec->gs_alloc_size = tls_gs_alloc_size;
+        if (!tls_stack_key_set) {
+            pthread_setspecific(g_tls_stack_key, tls_cleanup_rec);
+            tls_stack_key_set = 1;
+        }
     }
 }
 
@@ -87,11 +113,17 @@ void dbt_init_cpu_fxsave(newminhh_cpu_t *cpu) {
 
 uint32_t dbt_ensure_thread_tls_and_stack(newminhh_cpu_t *cpu, uint32_t min_stack_size) {
     if (cpu->gs_base == 0) {
-        unsigned long cur_gs = 0;
+        uint64_t cur_gs = 0;
         if (syscall(__NR_arch_prctl, ARCH_GET_GS, &cur_gs) == 0 && cur_gs != 0) {
             cpu->gs_base = (uint32_t)cur_gs;
         } else {
-            cpu->gs_base = dbt_init_tls_block(NULL);
+            uint32_t gs = dbt_init_tls_block(NULL);
+            cpu->gs_base = gs;
+            if (gs >= 8192u && tls_gs_alloc_base == 0) {
+                tls_gs_alloc_base = gs - 8192u;
+                tls_gs_alloc_size = 16384u;
+                register_tls_cleanup_if_needed();
+            }
         }
     }
     if (cpu->gpr[NM_REG_ESP] == 0) {
@@ -102,15 +134,7 @@ uint32_t dbt_ensure_thread_tls_and_stack(newminhh_cpu_t *cpu, uint32_t min_stack
             if (stk != MAP_FAILED) {
                 tls_stack_base = (uint32_t)(uintptr_t)stk;
                 tls_stack_size = sz;
-                if (!tls_stack_key_set) {
-                    tls_stack_cleanup_t *c = (tls_stack_cleanup_t *)malloc(sizeof(*c));
-                    if (c) {
-                        c->base = tls_stack_base;
-                        c->size = tls_stack_size;
-                        pthread_setspecific(g_tls_stack_key, c);
-                        tls_stack_key_set = 1;
-                    }
-                }
+                register_tls_cleanup_if_needed();
             }
         }
         if (tls_stack_base != 0) {
@@ -228,15 +252,8 @@ static void *dbt_lookup_or_translate(uint32_t guest_eip, int is_stub, uint32_t s
         return NULL;
     }
 
-    dbt_block_node_t *node = (dbt_block_node_t *)calloc(1, sizeof(*node));
-    if (!node) return host_code;
-    node->guest_eip = guest_eip;
-    node->guest_end = guest_end;
-    node->host_code = host_code;
-    node->host_size = host_size;
-    node->valid = 1;
-
     pthread_mutex_lock(&g_jit_lock);
+    dbt_block_node_t *reuse_node = NULL;
     for (dbt_block_node_t *n = g_block_buckets[bidx]; n; n = n->next) {
         if (n->valid && n->guest_eip == guest_eip) {
             void *existing = n->host_code;
@@ -244,12 +261,32 @@ static void *dbt_lookup_or_translate(uint32_t guest_eip, int is_stub, uint32_t s
                              pack_fast_entry(guest_eip, existing),
                              __ATOMIC_RELEASE);
             pthread_mutex_unlock(&g_jit_lock);
-            free(node);
             return existing;
         }
+        if (!n->valid && !reuse_node) {
+            reuse_node = n;
+        }
     }
-    node->next = g_block_buckets[bidx];
-    g_block_buckets[bidx] = node;
+    if (reuse_node) {
+        reuse_node->guest_eip = guest_eip;
+        reuse_node->guest_end = guest_end;
+        reuse_node->host_code = host_code;
+        reuse_node->host_size = host_size;
+        reuse_node->valid = 1;
+    } else {
+        dbt_block_node_t *node = (dbt_block_node_t *)calloc(1, sizeof(*node));
+        if (!node) {
+            pthread_mutex_unlock(&g_jit_lock);
+            return host_code;
+        }
+        node->guest_eip = guest_eip;
+        node->guest_end = guest_end;
+        node->host_code = host_code;
+        node->host_size = host_size;
+        node->valid = 1;
+        node->next = g_block_buckets[bidx];
+        g_block_buckets[bidx] = node;
+    }
     __atomic_store_n(&g_dbt_fast_cache[fidx].raw,
                      pack_fast_entry(guest_eip, host_code),
                      __ATOMIC_RELEASE);

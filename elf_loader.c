@@ -256,6 +256,9 @@ static void init_brk_arena(uint32_t map_base, uint32_t map_size) {
         g_brk_base = (uint32_t)(uintptr_t)brk_mem;
         g_brk_cur = g_brk_base;
         g_brk_limit = g_brk_base + DBT_BRK_ARENA_SIZE;
+        if (g_next_dyn_hint >= g_brk_base && g_next_dyn_hint < g_brk_limit) {
+            g_next_dyn_hint = page_up(g_brk_limit + 0x10000u);
+        }
     }
     int ok = (g_brk_base != 0);
     pthread_mutex_unlock(&g_brk_lock);
@@ -735,6 +738,30 @@ static int apply_reloc_table(dbt_module_t *mod, const void *tbl_ptr, uint32_t tb
     return NM_OK;
 }
 
+static void abort_loaded_dep_locked(dbt_module_t *dep) {
+    if (!dep || !dep->in_use || dep->unloading) return;
+    if (--dep->refcount > 0) return;
+    dep->unloading = 1;
+    int ndeps = dep->num_deps;
+    dbt_module_t *subdeps[DBT_MAX_DEPS];
+    for (int i = 0; i < ndeps; i++) {
+        subdeps[i] = dep->deps[i];
+    }
+    __atomic_store_n(&dep->num_rx_ranges, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&dep->in_use, 0, __ATOMIC_RELEASE);
+    if (dep->map_base && dep->map_size) {
+        munmap((void *)(uintptr_t)dep->map_base, dep->map_size);
+        if (dep->map_base >= 0x10000000u && dep->map_base < g_next_dyn_hint &&
+            (dep->map_base + dep->map_size <= g_brk_base || dep->map_base >= g_brk_limit)) {
+            g_next_dyn_hint = dep->map_base;
+        }
+    }
+    memset(dep, 0, sizeof(*dep));
+    for (int i = 0; i < ndeps; i++) {
+        abort_loaded_dep_locked(subdeps[i]);
+    }
+}
+
 static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *path,
                            int is_main, dbt_module_t **out_mod) {
     if (!blob || blob_size < sizeof(Elf32_Ehdr)) {
@@ -877,10 +904,14 @@ static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *pa
         load_bias = 0;
     } else {
         uint32_t hint = g_next_dyn_hint;
-        for (int attempt = 0; attempt < 32; attempt++) {
+        for (int attempt = 0; attempt < 64; attempt++) {
             if (hint + span >= 0x5E000000u) {
-                NM_LOG_ERROR("elf", "'%s': no virtual space below 0x60000000 for ET_DYN", path);
-                return NM_ERR_ELF;
+                hint = (g_brk_limit >= 0x10000000u && g_brk_limit < 0x50000000u)
+                           ? page_up(g_brk_limit + 0x10000u)
+                           : 0x10000000u;
+            }
+            if (g_brk_base != 0 && hint + span > g_brk_base && hint < g_brk_limit) {
+                hint = page_up(g_brk_limit + 0x10000u);
             }
             mapped = mmap((void *)(uintptr_t)hint, span, PROT_READ | PROT_WRITE,
                           MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1106,6 +1137,10 @@ static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *pa
             const char *dep_name = mod->strtab + needed_offs[i];
             if (is_canonical_system_lib(dep_name)) continue;
 
+            if (mod->num_deps >= DBT_MAX_DEPS) {
+                NM_LOG_ERROR("elf", "'%s': exceeded DBT_MAX_DEPS (%d)", path, DBT_MAX_DEPS);
+                goto fail_cleanup;
+            }
             dbt_module_t *dep_mod = find_loaded_module_by_name(dep_name);
             if (!dep_mod) {
                 char dep_path[512];
@@ -1125,9 +1160,7 @@ static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *pa
             } else {
                 dep_mod->refcount++;
             }
-            if (mod->num_deps < DBT_MAX_DEPS) {
-                mod->deps[mod->num_deps++] = dep_mod;
-            }
+            mod->deps[mod->num_deps++] = dep_mod;
         }
 
         /* Apply relocations */
@@ -1170,6 +1203,9 @@ static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *pa
     return NM_OK;
 
 fail_cleanup_dlsym:
+    for (int i = 0; i < mod->num_deps; i++) {
+        abort_loaded_dep_locked(mod->deps[i]);
+    }
     __atomic_store_n(&mod->num_rx_ranges, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&mod->in_use, 0, __ATOMIC_RELEASE);
     if (is_main) {
@@ -1181,6 +1217,9 @@ fail_cleanup_dlsym:
     return NM_ERR_DLSYM;
 
 fail_cleanup:
+    for (int i = 0; i < mod->num_deps; i++) {
+        abort_loaded_dep_locked(mod->deps[i]);
+    }
     __atomic_store_n(&mod->num_rx_ranges, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&mod->in_use, 0, __ATOMIC_RELEASE);
     if (is_main) {
@@ -1499,8 +1538,18 @@ void *newminhh_dbt_dlsym(void *handle, const char *sym) {
         }
     }
     void *tramp = newminhh_alloc_cb_trampoline(va, NULL, NM_CB_MODE_DBT, NM_CB_FLAG_UNTYPED);
-    if (tramp && g_dlsym_cache_n < DBT_DLSYM_CACHE_CAP) {
-        g_dlsym_cache[g_dlsym_cache_n++] = (dbt_dlsym_cache_entry_t){mod, va, tramp};
+    if (tramp) {
+        int placed = 0;
+        for (int i = 0; i < g_dlsym_cache_n; i++) {
+            if (g_dlsym_cache[i].mod == NULL) {
+                g_dlsym_cache[i] = (dbt_dlsym_cache_entry_t){mod, va, tramp};
+                placed = 1;
+                break;
+            }
+        }
+        if (!placed && g_dlsym_cache_n < DBT_DLSYM_CACHE_CAP) {
+            g_dlsym_cache[g_dlsym_cache_n++] = (dbt_dlsym_cache_entry_t){mod, va, tramp};
+        }
     }
     pthread_mutex_unlock(&g_loader_lock);
     if (!tramp) {
@@ -1526,6 +1575,11 @@ int newminhh_dbt_dlclose(void *handle) {
     mod->unloading = 1;
     uint32_t map_base = mod->map_base;
     uint32_t map_size = mod->map_size;
+    int num_deps = mod->num_deps;
+    dbt_module_t *deps[DBT_MAX_DEPS];
+    for (int i = 0; i < num_deps; i++) {
+        deps[i] = mod->deps[i];
+    }
     pthread_mutex_unlock(&g_loader_lock);
 
     dbt_run_module_finis(mod);
@@ -1543,9 +1597,19 @@ int newminhh_dbt_dlclose(void *handle) {
     }
     if (map_base && map_size) {
         munmap((void *)(uintptr_t)map_base, map_size);
+        if (map_base >= 0x10000000u && map_base < g_next_dyn_hint &&
+            (map_base + map_size <= g_brk_base || map_base >= g_brk_limit)) {
+            g_next_dyn_hint = map_base;
+        }
     }
     memset(mod, 0, sizeof(*mod));
     pthread_mutex_unlock(&g_loader_lock);
+
+    for (int i = 0; i < num_deps; i++) {
+        if (deps[i]) {
+            newminhh_dbt_dlclose(deps[i]);
+        }
+    }
     return 0;
 }
 
