@@ -1,0 +1,8 @@
+*.o
+*.so
+*.so.*
+*.a
+newminhh-run
+*.swp
+*~
+.DS_Store

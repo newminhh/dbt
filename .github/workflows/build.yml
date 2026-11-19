@@ -1,0 +1,67 @@
+name: Build dbt (x32)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-x32:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout newminhh/dbt
+        uses: actions/checkout@v4
+        with:
+          path: dbt
+
+      - name: Pull shared headers from newminhh/common
+        uses: actions/checkout@v4
+        with:
+          repository: newminhh/common
+          path: common
+
+      - name: Pull newminhh/compat dependency
+        uses: actions/checkout@v4
+        with:
+          repository: newminhh/compat
+          path: compat
+
+      - name: Install x32 toolchain and build x32 Capstone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib binutils cmake git file
+          git clone --depth 1 --branch 5.0.3 https://github.com/capstone-engine/capstone.git /tmp/capstone
+          cmake -S /tmp/capstone -B /tmp/capstone/build \
+            -DCMAKE_C_FLAGS="-mx32 -O2 -fPIC" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-mx32" \
+            -DCAPSTONE_BUILD_SHARED=ON \
+            -DCAPSTONE_BUILD_STATIC=OFF \
+            -DCAPSTONE_BUILD_TESTS=OFF \
+            -DCAPSTONE_BUILD_CSTOOL=OFF \
+            -DCAPSTONE_ARCHITECTURE_DEFAULT=OFF \
+            -DCAPSTONE_X86_SUPPORT=ON
+          cmake --build /tmp/capstone/build -j"$(nproc)"
+          sudo mkdir -p /usr/local/lib/x86_64-linux-gnux32 /usr/local/include
+          sudo cp -a /tmp/capstone/build/libcapstone.so* /usr/local/lib/x86_64-linux-gnux32/
+          sudo cp -r /tmp/capstone/include/capstone /usr/local/include/
+
+      - name: Build libnewminhh_compat.so, libnewminhh_dbt.so, and newminhh-run (x32)
+        run: |
+          make -C compat CC="gcc -mx32" all
+          make -C dbt CC="gcc -mx32" \
+            CFLAGS="-fPIC -O2 -Wall -Wextra -Werror=implicit-function-declaration -I../common -I/usr/local/include" \
+            BIN_CFLAGS="-O2 -Wall -Wextra -Werror=implicit-function-declaration -I../common -I/usr/local/include" \
+            LIBDIR="/usr/local/lib/x86_64-linux-gnux32" \
+            all
+          file dbt/libnewminhh_dbt.so dbt/newminhh-run
+          readelf -h dbt/libnewminhh_dbt.so dbt/newminhh-run | grep -E "Class:|Machine:"
+
+      - name: Upload dbt build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: newminhh-dbt-x32
+          path: |
+            dbt/libnewminhh_dbt.so
+            dbt/newminhh-run
