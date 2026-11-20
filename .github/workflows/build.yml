@@ -7,6 +7,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build-x32:
     runs-on: ubuntu-latest
@@ -57,6 +60,8 @@ jobs:
             all
           file dbt/libnewminhh_dbt.so dbt/newminhh-run
           readelf -h dbt/libnewminhh_dbt.so dbt/newminhh-run | grep -E "Class:|Machine:"
+          ! readelf -W -l dbt/libnewminhh_dbt.so | grep "GNU_STACK" | grep -q "RWE"
+          ! readelf -W -l dbt/newminhh-run | grep "GNU_STACK" | grep -q "RWE"
 
       - name: Upload dbt build artifacts
         uses: actions/upload-artifact@v4

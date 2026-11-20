@@ -18,11 +18,11 @@ LIB_C_SRCS := \
 LIB_S_SRCS := dbt_trampolines.S
 LIB_OBJS := $(LIB_C_SRCS:.c=.o) $(LIB_S_SRCS:.S=.o)
 
-LIB_LDFLAGS := -shared -Wl,-soname,$(LIB_TARGET) -L$(COMPAT_DIR) -L$(LIBDIR) -Wl,-rpath,$(LIBDIR)
+LIB_LDFLAGS := -shared -Wl,-soname,$(LIB_TARGET) -Wl,-z,noexecstack -Wl,-z,relro -Wl,-z,now -L$(COMPAT_DIR) -L$(LIBDIR) -Wl,-rpath,$(LIBDIR)
 LIB_LIBS := -lnewminhh_compat -lcapstone -ldl -lpthread -lm
 
 BIN_CFLAGS := -O2 -Wall -Wextra -Werror=implicit-function-declaration -I../common
-BIN_LDFLAGS := -no-pie -Wl,-Ttext-segment=0x70000000 -L. -L$(COMPAT_DIR) -L$(LIBDIR) -Wl,-rpath,$(LIBDIR)
+BIN_LDFLAGS := -no-pie -Wl,-Ttext-segment=0x70000000 -Wl,-z,noexecstack -Wl,-z,relro -Wl,-z,now -L. -L$(COMPAT_DIR) -L$(LIBDIR) -Wl,-rpath,$(LIBDIR)
 BIN_LIBS := -lnewminhh_dbt -lnewminhh_compat -ldl -lpthread
 
 .PHONY: all clean install
