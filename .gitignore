@@ -3,6 +3,7 @@
 *.so.*
 *.a
 newminhh-run
+*.plist
 *.swp
 *~
 .DS_Store
