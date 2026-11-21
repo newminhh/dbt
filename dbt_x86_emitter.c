@@ -182,15 +182,15 @@ static void emit_indirect_dispatch_r10d(emit_ctx_t *ctx) {
     emit_jmp_trampoline_exit(ctx);
 }
 
-static int is_esp_reg(x86_reg r) {
+[[nodiscard]] static int is_esp_reg(x86_reg r) {
     return (r == X86_REG_ESP || r == X86_REG_SP);
 }
 
-static int is_hi8_reg(x86_reg r) {
+[[nodiscard]] static int is_hi8_reg(x86_reg r) {
     return (r == X86_REG_AH || r == X86_REG_CH || r == X86_REG_DH || r == X86_REG_BH);
 }
 
-static int reg_code_gpr(x86_reg r) {
+[[nodiscard]] static int reg_code_gpr(x86_reg r) {
     switch (r) {
     case X86_REG_EAX: case X86_REG_AX: case X86_REG_AL: return 0;
     case X86_REG_ECX: case X86_REG_CX: case X86_REG_CL: return 1;
@@ -219,10 +219,10 @@ static void emit_hi8_swap(emit_ctx_t *ctx, x86_reg r) {
 static void emit_lea_mem_to_r10d(emit_ctx_t *ctx, const x86_op_mem *mem, int with_gs) {
     int base_c = (mem->base != X86_REG_INVALID) ? reg_code_gpr(mem->base) : -1;
     int idx_c = (mem->index != X86_REG_INVALID) ? reg_code_gpr(mem->index) : -1;
-    uint8_t sbits = 0;
-    if (mem->scale == 2) sbits = 1;
-    else if (mem->scale == 4) sbits = 2;
-    else if (mem->scale == 8) sbits = 3;
+    uint8_t sbits = 0b00;
+    if (mem->scale == 2) sbits = 0b01;
+    else if (mem->scale == 4) sbits = 0b10;
+    else if (mem->scale == 8) sbits = 0b11;
 
     if (base_c < 0 && idx_c < 0) {
         /* movl $disp32, %r10d : 41 ba <u32> */
@@ -230,9 +230,10 @@ static void emit_lea_mem_to_r10d(emit_ctx_t *ctx, const x86_op_mem *mem, int wit
     } else {
         /* 0x67 lea <mem>, %r10d (reg=2, REX.R=1) */
         emit8(ctx, 0x67);
-        uint8_t rex = 0x44; /* REX.R for R10 */
-        if (base_c == 4) rex |= 0x01; /* REX.B for R12 */
-        if (idx_c == 4) rex |= 0x02;  /* REX.X for R12 */
+        /* REX prefix: 0100'WRXB */
+        uint8_t rex = 0b0100'0100u; /* REX.R for R10 */
+        if (base_c == 4) rex |= 0b0000'0001u; /* REX.B for R12 */
+        if (idx_c == 4) rex |= 0b0000'0010u;  /* REX.X for R12 */
         emit8(ctx, rex);
         emit8(ctx, 0x8D);
         if (idx_c < 0 && base_c != 4) {
@@ -272,7 +273,7 @@ static void emit_load_rm32_to_r10d(emit_ctx_t *ctx, const cs_x86_op *op, int siz
         int r = reg_code_gpr(op->reg);
         if (size_bytes == 2) emit8(ctx, 0x66);
         /* mov %reg, %r10d : 41 89 <c0|(r<<3)|2> (if r==ESP, REX.R=1 -> 45) */
-        uint8_t rex = 0x41 | (r == 4 ? 0x04 : 0x00);
+        uint8_t rex = 0b0100'0001u | (r == 4 ? 0b0000'0100u : 0b0000'0000u);
         emit8(ctx, rex);
         emit8(ctx, 0x89);
         emit8(ctx, (uint8_t)(0xC0 | ((r & 7) << 3) | 2));
@@ -355,7 +356,7 @@ static void emit_lea_r12d_delta(emit_ctx_t *ctx, int32_t delta) {
     }
 }
 
-static int is_unsupported_insn(unsigned int id, const cs_x86 *x) {
+[[nodiscard]] static int is_unsupported_insn(unsigned int id, const cs_x86 *x) {
     switch (id) {
     case X86_INS_HLT:
     case X86_INS_UD0:
@@ -428,7 +429,7 @@ static int is_unsupported_insn(unsigned int id, const cs_x86 *x) {
     }
 }
 
-static int jcc_to_opcode2(unsigned int id) {
+[[nodiscard]] static int jcc_to_opcode2(unsigned int id) {
     switch (id) {
     case X86_INS_JO:  return 0x80;
     case X86_INS_JNO: return 0x81;
@@ -450,7 +451,7 @@ static int jcc_to_opcode2(unsigned int id) {
     }
 }
 
-static int is_legacy_prefix(uint8_t b) {
+[[nodiscard]] static int is_legacy_prefix(uint8_t b) {
     switch (b) {
     case 0xF0: case 0xF2: case 0xF3:
     case 0x26: case 0x2E: case 0x36: case 0x3E:
@@ -461,11 +462,11 @@ static int is_legacy_prefix(uint8_t b) {
     }
 }
 
-static int is_seg_prefix(uint8_t b) {
+[[nodiscard]] static int is_seg_prefix(uint8_t b) {
     return (b == 0x26 || b == 0x2E || b == 0x36 || b == 0x3E || b == 0x64 || b == 0x65);
 }
 
-static int is_string_op(unsigned int id) {
+[[nodiscard]] static int is_string_op(unsigned int id) {
     switch (id) {
     case X86_INS_MOVSB: case X86_INS_MOVSW: case X86_INS_MOVSD:
     case X86_INS_STOSB: case X86_INS_STOSW: case X86_INS_STOSD:
@@ -478,7 +479,7 @@ static int is_string_op(unsigned int id) {
     }
 }
 
-static int emit_passthru_insn(emit_ctx_t *ctx, const cs_insn *insn) {
+[[nodiscard]] static int emit_passthru_insn(emit_ctx_t *ctx, const cs_insn *insn) {
     const cs_x86 *x = &insn->detail->x86;
     const uint8_t *bytes = insn->bytes;
     uint8_t size = (uint8_t)insn->size;
@@ -539,7 +540,7 @@ static int emit_passthru_insn(emit_ctx_t *ctx, const cs_insn *insn) {
 
     /* Find memory operand and hi8/esp register operands */
     int has_mem = 0;
-    const x86_op_mem *mem_op = NULL;
+    const x86_op_mem *mem_op = nullptr;
     int has_gs = 0;
     x86_reg hi8_reg = X86_REG_INVALID;
     int has_esp = 0;

@@ -31,11 +31,14 @@ Executes unmodified i386 (`ELFCLASS32`, `EM_386`) executables and shared librari
 
 ## Build, Install & CLI Usage
 
-Requires [`newminhh/common`](https://github.com/newminhh/common) (`../common`), [`newminhh/compat`](https://github.com/newminhh/compat) (`../compat`), and `libcapstone-dev` on an x32 system:
+Built with **GNU C23 (`-std=gnu23`)** using **Clang (`>= 21`, default `CC ?= clang`)** as primary compiler or **GCC (`>= 15`)** as secondary compiler. Requires [`newminhh/common`](https://github.com/newminhh/common) (`../common`), [`newminhh/compat`](https://github.com/newminhh/compat) (`../compat`), and `libcapstone-dev` on an x32 system:
 
 ```bash
-make all
-make install   # installs libnewminhh_dbt.so to $(LIBDIR) and newminhh-run to $(BINDIR)
+make all           # builds libnewminhh_dbt.so and newminhh-run (Clang default)
+make CC=gcc all    # builds with GCC 15/16
+make analyze       # runs static analysis (scan-build under Clang, -fanalyzer under GCC)
+make install       # installs libnewminhh_dbt.so to $(LIBDIR) and newminhh-run to $(BINDIR)
+make clean
 ```
 
 Execute an i386 executable or shared library symbol directly on x32:

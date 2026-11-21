@@ -9,6 +9,9 @@
 #include <libgen.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <stdatomic.h>
+#include <stdbit.h>
+#include <stdckdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,12 +46,19 @@
 #define DBT_GUEST_STACK_SZ  (8u * 1024u * 1024u)
 #define DBT_MAX_DL_HANDLES  128
 
+constexpr uint32_t DBT_DYN_HINT_BASE       = 0x10000000u;
+constexpr uint32_t DBT_DYN_FALLBACK_BASE   = 0x20000000u;
+constexpr uint32_t DBT_BRK_HINT_BASE       = 0x30000000u;
+constexpr uint32_t DBT_SEGV_ARENA_BASE     = 0x5E000000u;
+constexpr uint32_t DBT_STUB_ARENA_BASE     = 0x5F000000u;
+constexpr uint32_t DBT_JIT_ARENA_BASE      = 0x60000000u;
+
 static pthread_mutex_t g_loader_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_stub_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_brk_lock = PTHREAD_MUTEX_INITIALIZER;
 static dbt_module_t g_modules[DBT_MAX_MODULES];
-static dbt_module_t *g_main_mod = NULL;
-static uint32_t g_next_dyn_hint = 0x10000000u;
+static dbt_module_t *g_main_mod = nullptr;
+static uint32_t g_next_dyn_hint = DBT_DYN_HINT_BASE;
 
 /* Guest brk arena */
 static uint32_t g_brk_base = 0;
@@ -56,9 +66,9 @@ static uint32_t g_brk_cur = 0;
 static uint32_t g_brk_limit = 0;
 
 /* Synthetic compat stub arena: each stub is 8 bytes: 0xCC, 'N', 'M', 0x90, <stub_id:u32> */
-static uint8_t *g_stub_arena = NULL;
+static _Atomic(uint8_t *) g_stub_arena = nullptr;
 static dbt_stub_entry_t g_stubs[DBT_MAX_STUBS];
-static uint32_t g_num_stubs = 0;
+static _Atomic uint32_t g_num_stubs = 0;
 
 /* Guest-side dlopen handle table */
 typedef struct {
@@ -70,8 +80,8 @@ typedef struct {
 } dbt_guest_dl_handle_t;
 
 static dbt_guest_dl_handle_t g_guest_dl_handles[DBT_MAX_DL_HANDLES];
-static __thread char tls_dbt_dlerror[512];
-static __thread int tls_dbt_dlerror_pending = 0;
+static thread_local char tls_dbt_dlerror[512];
+static thread_local int tls_dbt_dlerror_pending = 0;
 
 void dbt_set_dlerror(const char *fmt, ...) {
     va_list ap;
@@ -84,7 +94,7 @@ void dbt_set_dlerror(const char *fmt, ...) {
 
 const char *newminhh_dbt_dlerror(void) {
     if (!tls_dbt_dlerror_pending) {
-        return NULL;
+        return nullptr;
     }
     tls_dbt_dlerror_pending = 0;
     return tls_dbt_dlerror;
@@ -99,28 +109,39 @@ static inline uint32_t page_down(uint32_t v) {
 }
 
 static inline uint32_t page_up(uint32_t v) {
-    return (v + 0xFFFu) & ~0xFFFu;
+    uint32_t res = 0;
+    if (ckd_add(&res, v, 0xFFFu)) {
+        return 0xFFFFF000u;
+    }
+    return res & ~0xFFFu;
 }
 
 static uint32_t align_up(uint32_t v, uint32_t align) {
     if (align <= 1u) return v;
-    return (v + align - 1u) & ~(align - 1u);
+    if (!stdc_has_single_bit(align)) {
+        align = stdc_bit_ceil(align);
+    }
+    uint32_t res = 0;
+    if (ckd_add(&res, v, align - 1u)) {
+        return 0xFFFFFFFFu;
+    }
+    return res & ~(align - 1u);
 }
 
 static int ensure_stub_arena(void) {
-    if (g_stub_arena) return 0;
+    if (atomic_load_explicit(&g_stub_arena, memory_order_acquire)) return 0;
     size_t sz = page_up(DBT_MAX_STUBS * DBT_STUB_STRIDE);
-    void *mem = mmap((void *)0x5F000000u, sz, PROT_READ | PROT_WRITE,
+    void *mem = mmap((void *)(uintptr_t)DBT_STUB_ARENA_BASE, sz, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) {
-        mem = mmap(NULL, sz, PROT_READ | PROT_WRITE,
+        mem = mmap(nullptr, sz, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     }
     if (mem == MAP_FAILED) {
         NM_LOG_ERROR("elf", "failed to map synthetic stub arena: errno=%d", errno);
         return -1;
     }
-    g_stub_arena = (uint8_t *)mem;
+    atomic_store_explicit(&g_stub_arena, (uint8_t *)mem, memory_order_release);
     return 0;
 }
 
@@ -143,20 +164,22 @@ uint32_t dbt_alloc_stub_for_sym(const char *name, const nm_sym_entry_t *entry) {
         pthread_mutex_unlock(&g_stub_lock);
         return 0;
     }
-    for (uint32_t i = 0; i < g_num_stubs; i++) {
+    for (uint32_t i = 0; i < atomic_load_explicit(&g_num_stubs, memory_order_acquire); i++) {
         if (strcmp(g_stubs[i].name, name) == 0) {
             uint32_t va = g_stubs[i].stub_va;
             pthread_mutex_unlock(&g_stub_lock);
             return va;
         }
     }
-    if (g_num_stubs >= DBT_MAX_STUBS) {
+    uint32_t current_stubs = atomic_load_explicit(&g_num_stubs, memory_order_acquire);
+    if (current_stubs >= DBT_MAX_STUBS) {
         pthread_mutex_unlock(&g_stub_lock);
         NM_LOG_ERROR("elf", "synthetic stub table exhausted (%u)", DBT_MAX_STUBS);
         return 0;
     }
-    uint32_t id = g_num_stubs;
-    uint8_t *slot = g_stub_arena + (size_t)id * DBT_STUB_STRIDE;
+    uint32_t id = current_stubs;
+    uint8_t *arena_base = atomic_load_explicit(&g_stub_arena, memory_order_acquire);
+    uint8_t *slot = arena_base + (size_t)id * DBT_STUB_STRIDE;
     slot[0] = 0xCC;
     slot[1] = 'N';
     slot[2] = 'M';
@@ -168,16 +191,16 @@ uint32_t dbt_alloc_stub_for_sym(const char *name, const nm_sym_entry_t *entry) {
     se->sym = *entry;
     se->kind = classify_stub_kind(name);
     se->stub_va = (uint32_t)(uintptr_t)slot;
-    __atomic_store_n(&g_num_stubs, id + 1u, __ATOMIC_RELEASE);
+    atomic_store_explicit(&g_num_stubs, id + 1u, memory_order_release);
     uint32_t va = se->stub_va;
     pthread_mutex_unlock(&g_stub_lock);
     return va;
 }
 
 int dbt_is_stub_va(uint32_t va, uint32_t *out_stub_id) {
-    uint8_t *arena = __atomic_load_n(&g_stub_arena, __ATOMIC_ACQUIRE);
+    uint8_t *arena = atomic_load_explicit(&g_stub_arena, memory_order_acquire);
     if (!arena) return 0;
-    uint32_t count = __atomic_load_n(&g_num_stubs, __ATOMIC_ACQUIRE);
+    uint32_t count = atomic_load_explicit(&g_num_stubs, memory_order_acquire);
     uint32_t base = (uint32_t)(uintptr_t)arena;
     uint32_t end = base + count * DBT_STUB_STRIDE;
     if (va < base || va >= end) return 0;
@@ -191,15 +214,15 @@ int dbt_is_stub_va(uint32_t va, uint32_t *out_stub_id) {
 }
 
 const dbt_stub_entry_t *dbt_get_stub(uint32_t stub_id) {
-    uint32_t count = __atomic_load_n(&g_num_stubs, __ATOMIC_ACQUIRE);
-    if (stub_id >= count) return NULL;
+    uint32_t count = atomic_load_explicit(&g_num_stubs, memory_order_acquire);
+    if (stub_id >= count) return nullptr;
     return &g_stubs[stub_id];
 }
 
 int dbt_is_guest_rx_va(uint32_t va) {
     for (int i = 0; i < DBT_MAX_MODULES; i++) {
-        if (!__atomic_load_n(&g_modules[i].in_use, __ATOMIC_ACQUIRE)) continue;
-        int nr = __atomic_load_n(&g_modules[i].num_rx_ranges, __ATOMIC_ACQUIRE);
+        if (!atomic_load_explicit(&g_modules[i].in_use, memory_order_acquire)) continue;
+        int nr = atomic_load_explicit(&g_modules[i].num_rx_ranges, memory_order_acquire);
         for (int r = 0; r < nr; r++) {
             if (va >= g_modules[i].rx_ranges[r].start &&
                 va < g_modules[i].rx_ranges[r].end) {
@@ -249,7 +272,7 @@ static void init_brk_arena(uint32_t map_base, uint32_t map_size) {
     void *brk_mem = mmap((void *)(uintptr_t)brk_hint, DBT_BRK_ARENA_SIZE, PROT_NONE,
                          MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (brk_mem == MAP_FAILED) {
-        brk_mem = mmap((void *)(uintptr_t)0x30000000u, DBT_BRK_ARENA_SIZE, PROT_NONE,
+        brk_mem = mmap((void *)(uintptr_t)DBT_BRK_HINT_BASE, DBT_BRK_ARENA_SIZE, PROT_NONE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     }
     if (brk_mem != MAP_FAILED) {
@@ -292,7 +315,7 @@ static int is_canonical_system_lib(const char *name) {
         "libstdc++.so.6",
         "ld-linux.so.2"
     };
-    for (size_t i = 0; i < sizeof(sys_libs) / sizeof(sys_libs[0]); i++) {
+    for (size_t i = 0; i < NM_COUNTOF(sys_libs); i++) {
         if (strcmp(base, sys_libs[i]) == 0) return 1;
     }
     return 0;
@@ -308,13 +331,14 @@ static int strip_sym_ver(const char *name, char *out, size_t out_sz) {
 }
 
 static int va_in_phdrs(const Elf32_Phdr *phdrs, uint16_t phnum, uint32_t raw_va, uint32_t size) {
-    uint64_t end = (uint64_t)raw_va + (uint64_t)size;
-    if (end > 0xFFFFFFFFULL) return 0;
+    uint32_t end = 0;
+    if (ckd_add(&end, raw_va, size)) return 0;
     for (uint16_t i = 0; i < phnum; i++) {
         if (phdrs[i].p_type != PT_LOAD) continue;
-        uint64_t s = phdrs[i].p_vaddr;
-        uint64_t e = s + phdrs[i].p_memsz;
-        if ((uint64_t)raw_va >= s && end <= e) {
+        uint32_t s = phdrs[i].p_vaddr;
+        uint32_t e = 0;
+        if (ckd_add(&e, s, phdrs[i].p_memsz)) e = 0xFFFFFFFFu;
+        if (raw_va >= s && end <= e) {
             return 1;
         }
     }
@@ -475,7 +499,7 @@ static dbt_module_t *find_loaded_module_by_name(const char *path) {
             return &g_modules[i];
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 static int find_so_path(const char *soname, const char *requester_path, char *out_path, size_t out_sz) {
@@ -497,8 +521,8 @@ static int find_so_path(const char *soname, const char *requester_path, char *ou
     if (ld_path) {
         char buf[1024];
         snprintf(buf, sizeof(buf), "%s", ld_path);
-        char *save = NULL;
-        for (char *tok = strtok_r(buf, ":", &save); tok; tok = strtok_r(NULL, ":", &save)) {
+        char *save = nullptr;
+        for (char *tok = strtok_r(buf, ":", &save); tok; tok = strtok_r(nullptr, ":", &save)) {
             snprintf(out_path, out_sz, "%s/%s", tok, soname);
             if (access(out_path, R_OK) == 0) return 0;
         }
@@ -597,7 +621,7 @@ static int apply_reloc_table(dbt_module_t *mod, const void *tbl_ptr, uint32_t tb
         }
         if (type == R_386_IRELATIVE) {
             uint32_t resolver_va = mod->load_bias + A;
-            *P = newminhh_dbt_invoke_guest(resolver_va, 0, NULL);
+            *P = newminhh_dbt_invoke_guest(resolver_va, 0, nullptr);
             continue;
         }
         if (type == R_386_TLS_DTPMOD32) {
@@ -643,7 +667,7 @@ static int apply_reloc_table(dbt_module_t *mod, const void *tbl_ptr, uint32_t tb
         uint32_t S_size = 0;
         int resolved = 0;
         int is_compat_data = 0;
-        void *compat_data_ptr = NULL;
+        void *compat_data_ptr = nullptr;
 
         if (sym_idx == 0) {
             resolved = 1;
@@ -660,7 +684,7 @@ static int apply_reloc_table(dbt_module_t *mod, const void *tbl_ptr, uint32_t tb
                     is_compat_data = 1;
                     compat_data_ptr = ce.wrapper_fn;
                     /* Ensure stdio globals are initialized */
-                    FILE *fi = NULL, *fo = NULL, *fe = NULL;
+                    FILE *fi = nullptr, *fo = nullptr, *fe = nullptr;
                     newminhh_get_stdio_streams(&fi, &fo, &fe);
                 }
             }
@@ -670,7 +694,7 @@ static int apply_reloc_table(dbt_module_t *mod, const void *tbl_ptr, uint32_t tb
                 S = mod->load_bias + sym->st_value;
                 S_size = sym->st_size;
                 resolved = 1;
-            } else if (resolve_guest_symbol_global(clean_name, NULL, &S, &S_size)) {
+            } else if (resolve_guest_symbol_global(clean_name, nullptr, &S, &S_size)) {
                 resolved = 1;
             } else if (bind == STB_WEAK &&
                        (strcmp(clean_name, "_ITM_deregisterTMCloneTable") == 0 ||
@@ -685,7 +709,7 @@ static int apply_reloc_table(dbt_module_t *mod, const void *tbl_ptr, uint32_t tb
                     resolved = 1;
                     if (ce.flags & NM_SYM_FLAG_DATA) {
                         S = (uint32_t)(uintptr_t)ce.wrapper_fn;
-                        FILE *fi = NULL, *fo = NULL, *fe = NULL;
+                        FILE *fi = nullptr, *fo = nullptr, *fe = nullptr;
                         newminhh_get_stdio_streams(&fi, &fo, &fe);
                     } else {
                         S = dbt_alloc_stub_for_sym(clean_name, &ce);
@@ -747,8 +771,8 @@ static void abort_loaded_dep_locked(dbt_module_t *dep) {
     for (int i = 0; i < ndeps; i++) {
         subdeps[i] = dep->deps[i];
     }
-    __atomic_store_n(&dep->num_rx_ranges, 0, __ATOMIC_RELEASE);
-    __atomic_store_n(&dep->in_use, 0, __ATOMIC_RELEASE);
+    atomic_store_explicit(&dep->num_rx_ranges, 0, memory_order_release);
+    atomic_store_explicit(&dep->in_use, 0, memory_order_release);
     if (dep->map_base && dep->map_size) {
         munmap((void *)(uintptr_t)dep->map_base, dep->map_size);
         if (dep->map_base >= 0x10000000u && dep->map_base < g_next_dyn_hint &&
@@ -763,7 +787,7 @@ static void abort_loaded_dep_locked(dbt_module_t *dep) {
 }
 
 static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *path,
-                           int is_main, dbt_module_t **out_mod) {
+                           int is_main, dbt_module_t *NM_NULLABLE_PTR *NM_NONNULL_PTR out_mod) {
     if (!blob || blob_size < sizeof(Elf32_Ehdr)) {
         NM_LOG_ERROR("elf", "'%s': file truncated (%zu bytes < Elf32_Ehdr %zu bytes)",
                      path, blob_size, sizeof(Elf32_Ehdr));
@@ -798,7 +822,13 @@ static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *pa
                      path, eh->e_phentsize, eh->e_phnum);
         return NM_ERR_ELF;
     }
-    uint64_t ph_end = (uint64_t)eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(Elf32_Phdr);
+    uint64_t ph_bytes = 0;
+    uint64_t ph_end = 0;
+    if (ckd_mul(&ph_bytes, (uint64_t)eh->e_phnum, (uint64_t)sizeof(Elf32_Phdr)) ||
+        ckd_add(&ph_end, (uint64_t)eh->e_phoff, ph_bytes)) {
+        NM_LOG_ERROR("elf", "'%s': program header table bounds overflow", path);
+        return NM_ERR_ELF;
+    }
     if (eh->e_phoff > blob_size || ph_end > blob_size) {
         NM_LOG_ERROR("elf", "'%s': program header table out of file bounds", path);
         return NM_ERR_ELF;
@@ -808,15 +838,21 @@ static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *pa
     int has_load = 0;
     uint32_t min_vaddr = 0xFFFFFFFFu;
     uint32_t max_vaddr = 0u;
-    const Elf32_Phdr *dyn_ph = NULL;
-    const Elf32_Phdr *tls_ph = NULL;
+    const Elf32_Phdr *dyn_ph = nullptr;
+    const Elf32_Phdr *tls_ph = nullptr;
 
     for (uint16_t i = 0; i < eh->e_phnum; i++) {
         const Elf32_Phdr *ph = &phdrs[i];
         if (ph->p_type == PT_LOAD || ph->p_type == PT_DYNAMIC ||
             ph->p_type == PT_TLS || ph->p_type == PT_INTERP) {
-            if ((uint64_t)ph->p_offset > blob_size ||
-                (uint64_t)ph->p_offset + (uint64_t)ph->p_filesz > blob_size) {
+            uint64_t seg_off_end = 0;
+            uint64_t seg_va_end = 0;
+            if (ckd_add(&seg_off_end, (uint64_t)ph->p_offset, (uint64_t)ph->p_filesz) ||
+                ckd_add(&seg_va_end, (uint64_t)ph->p_vaddr, (uint64_t)ph->p_memsz)) {
+                NM_LOG_ERROR("elf", "'%s': phdr[%u] bounds overflow", path, i);
+                return NM_ERR_ELF;
+            }
+            if ((uint64_t)ph->p_offset > blob_size || seg_off_end > blob_size) {
                 NM_LOG_ERROR("elf", "'%s': phdr[%u] (type=%u) p_offset/p_filesz out of bounds",
                              path, i, ph->p_type);
                 return NM_ERR_ELF;
@@ -826,7 +862,7 @@ static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *pa
                              path, i, ph->p_filesz, ph->p_memsz);
                 return NM_ERR_ELF;
             }
-            if ((uint64_t)ph->p_vaddr + (uint64_t)ph->p_memsz > 0xFFFFFFFFULL) {
+            if (seg_va_end > 0xFFFFFFFFULL) {
                 NM_LOG_ERROR("elf", "'%s': phdr[%u] overflows 32-bit address space", path, i);
                 return NM_ERR_ELF;
             }
@@ -835,7 +871,12 @@ static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *pa
             if (ph->p_memsz == 0) continue;
             has_load = 1;
             uint32_t s = page_down(ph->p_vaddr);
-            uint32_t e = page_up(ph->p_vaddr + ph->p_memsz);
+            uint32_t seg_mem_end = 0;
+            if (ckd_add(&seg_mem_end, ph->p_vaddr, ph->p_memsz)) {
+                NM_LOG_ERROR("elf", "'%s': phdr[%u] p_vaddr+p_memsz overflow", path, i);
+                return NM_ERR_ELF;
+            }
+            uint32_t e = page_up(seg_mem_end);
             if (s < min_vaddr) min_vaddr = s;
             if (e > max_vaddr) max_vaddr = e;
         } else if (ph->p_type == PT_DYNAMIC) {
@@ -905,10 +946,11 @@ static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *pa
     } else {
         uint32_t hint = g_next_dyn_hint;
         for (int attempt = 0; attempt < 64; attempt++) {
-            if (hint + span >= 0x5E000000u) {
-                hint = (g_brk_limit >= 0x10000000u && g_brk_limit < 0x50000000u)
+            uint32_t hint_span = 0;
+            if (ckd_add(&hint_span, hint, span) || hint_span >= DBT_SEGV_ARENA_BASE) {
+                hint = (g_brk_limit >= DBT_DYN_HINT_BASE && g_brk_limit < 0x50000000u)
                            ? page_up(g_brk_limit + 0x10000u)
-                           : 0x10000000u;
+                           : DBT_DYN_HINT_BASE;
             }
             if (g_brk_base != 0 && hint + span > g_brk_base && hint < g_brk_limit) {
                 hint = page_up(g_brk_limit + 0x10000u);
@@ -922,10 +964,10 @@ static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *pa
             hint += 0x100000u;
         }
         if (mapped == MAP_FAILED) {
-            mapped = mmap((void *)(uintptr_t)0x20000000u, span, PROT_READ | PROT_WRITE,
+            mapped = mmap((void *)(uintptr_t)DBT_DYN_FALLBACK_BASE, span, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         }
-        if (mapped == MAP_FAILED || (uintptr_t)mapped + span >= 0x60000000ULL) {
+        if (mapped == MAP_FAILED || (uintptr_t)mapped + span >= (uint64_t)DBT_JIT_ARENA_BASE) {
             if (mapped != MAP_FAILED) munmap(mapped, span);
             NM_LOG_ERROR("elf", "'%s': ET_DYN mapping failed below 0x60000000", path);
             return NM_ERR_ELF;
@@ -959,9 +1001,15 @@ static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *pa
             memcpy((void *)(uintptr_t)(load_bias + ph->p_vaddr),
                    blob + ph->p_offset, ph->p_filesz);
         }
-        if (eh->e_phoff >= ph->p_offset &&
-            eh->e_phoff + (uint32_t)eh->e_phnum * sizeof(Elf32_Phdr) <= ph->p_offset + ph->p_filesz) {
-            mod->phdr_va = load_bias + ph->p_vaddr + (eh->e_phoff - ph->p_offset);
+        uint32_t ph_tbl_bytes = 0;
+        uint32_t ph_tbl_end = 0;
+        uint32_t ph_seg_end = 0;
+        if (!ckd_mul(&ph_tbl_bytes, (uint32_t)eh->e_phnum, (uint32_t)sizeof(Elf32_Phdr)) &&
+            !ckd_add(&ph_tbl_end, eh->e_phoff, ph_tbl_bytes) &&
+            !ckd_add(&ph_seg_end, ph->p_offset, ph->p_filesz)) {
+            if (eh->e_phoff >= ph->p_offset && ph_tbl_end <= ph_seg_end) {
+                mod->phdr_va = load_bias + ph->p_vaddr + (eh->e_phoff - ph->p_offset);
+            }
         }
         if (ph->p_flags & PF_X) {
             if (num_rx < DBT_MAX_RX_RANGES) {
@@ -971,8 +1019,8 @@ static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *pa
             }
         }
     }
-    __atomic_store_n(&mod->num_rx_ranges, num_rx, __ATOMIC_RELEASE);
-    __atomic_store_n(&mod->in_use, 1, __ATOMIC_RELEASE);
+    atomic_store_explicit(&mod->num_rx_ranges, num_rx, memory_order_release);
+    atomic_store_explicit(&mod->in_use, 1, memory_order_release);
 
     if (tls_ph && tls_ph->p_memsz > 0) {
         mod->has_tls = 1;
@@ -1149,7 +1197,7 @@ static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *pa
                     dbt_set_dlerror("missing guest dependency '%s'", dep_name);
                     goto fail_cleanup;
                 }
-                uint8_t *dep_buf = NULL;
+                uint8_t *dep_buf = nullptr;
                 size_t dep_sz = 0;
                 if (read_entire_file(dep_path, &dep_buf, &dep_sz) != NM_OK) {
                     goto fail_cleanup;
@@ -1206,10 +1254,10 @@ fail_cleanup_dlsym:
     for (int i = 0; i < mod->num_deps; i++) {
         abort_loaded_dep_locked(mod->deps[i]);
     }
-    __atomic_store_n(&mod->num_rx_ranges, 0, __ATOMIC_RELEASE);
-    __atomic_store_n(&mod->in_use, 0, __ATOMIC_RELEASE);
+    atomic_store_explicit(&mod->num_rx_ranges, 0, memory_order_release);
+    atomic_store_explicit(&mod->in_use, 0, memory_order_release);
     if (is_main) {
-        g_main_mod = NULL;
+        g_main_mod = nullptr;
         cleanup_brk_arena();
     }
     munmap((void *)(uintptr_t)mod->map_base, mod->map_size);
@@ -1220,10 +1268,10 @@ fail_cleanup:
     for (int i = 0; i < mod->num_deps; i++) {
         abort_loaded_dep_locked(mod->deps[i]);
     }
-    __atomic_store_n(&mod->num_rx_ranges, 0, __ATOMIC_RELEASE);
-    __atomic_store_n(&mod->in_use, 0, __ATOMIC_RELEASE);
+    atomic_store_explicit(&mod->num_rx_ranges, 0, memory_order_release);
+    atomic_store_explicit(&mod->in_use, 0, memory_order_release);
     if (is_main) {
-        g_main_mod = NULL;
+        g_main_mod = nullptr;
         cleanup_brk_arena();
     }
     munmap((void *)(uintptr_t)mod->map_base, mod->map_size);
@@ -1231,8 +1279,8 @@ fail_cleanup:
     return NM_ERR_ELF;
 }
 
-int dbt_load_main_file(const char *path, dbt_module_t **out_mod) {
-    uint8_t *buf = NULL;
+int dbt_load_main_file(const char *path, dbt_module_t *NM_NULLABLE_PTR *NM_NONNULL_PTR out_mod) {
+    uint8_t *buf = nullptr;
     size_t sz = 0;
     int rc = read_entire_file(path, &buf, &sz);
     if (rc != NM_OK) return rc;
@@ -1244,8 +1292,8 @@ int dbt_load_main_file(const char *path, dbt_module_t **out_mod) {
     return rc;
 }
 
-int dbt_load_main_memory(const void *blob, size_t blob_size, const char *name,
-                         dbt_module_t **out_mod) {
+int dbt_load_main_memory(const void *blob, size_t blob_size, const char *NM_NULLABLE_PTR name,
+                         dbt_module_t *NM_NULLABLE_PTR *NM_NONNULL_PTR out_mod) {
     pthread_mutex_lock(&g_loader_lock);
     int rc = load_guest_blob((const uint8_t *)blob, blob_size,
                              name ? name : "<embedded>", 1, out_mod);
@@ -1255,7 +1303,7 @@ int dbt_load_main_memory(const void *blob, size_t blob_size, const char *name,
 
 uint32_t dbt_init_tls_block(dbt_module_t *mod) {
     size_t area_sz = 16384u;
-    uint8_t *mem = (uint8_t *)mmap(NULL, area_sz, PROT_READ | PROT_WRITE,
+    uint8_t *mem = (uint8_t *)mmap(nullptr, area_sz, PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) return 0;
 
@@ -1278,9 +1326,13 @@ uint32_t dbt_init_tls_block(dbt_module_t *mod) {
     return gs_base;
 }
 
-int dbt_setup_guest_stack(dbt_module_t *main_mod, int argc, char **argv, char **envp,
-                          uint32_t *out_esp, uint32_t *out_stack_base, uint32_t *out_stack_size) {
-    uint8_t *stk = (uint8_t *)mmap(NULL, DBT_GUEST_STACK_SZ, PROT_READ | PROT_WRITE,
+int dbt_setup_guest_stack(dbt_module_t *NM_NULLABLE_PTR main_mod, int argc,
+                          char *NM_NULLABLE_PTR *NM_NULLABLE_PTR argv,
+                          char *NM_NULLABLE_PTR *NM_NULLABLE_PTR envp,
+                          uint32_t *out_esp,
+                          uint32_t *NM_NULLABLE_PTR out_stack_base,
+                          uint32_t *NM_NULLABLE_PTR out_stack_size) {
+    uint8_t *stk = (uint8_t *)mmap(nullptr, DBT_GUEST_STACK_SZ, PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (stk == MAP_FAILED) {
         NM_LOG_ERROR("elf", "failed to mmap 8 MiB guest stack: errno=%d", errno);
@@ -1365,9 +1417,11 @@ int dbt_setup_guest_stack(dbt_module_t *main_mod, int argc, char **argv, char **
     return NM_OK;
 }
 
-void dbt_run_module_inits(dbt_module_t *mod, int argc, char **argv, char **envp) {
-    if (!mod || !__atomic_load_n(&mod->in_use, __ATOMIC_ACQUIRE)) return;
-    if (__atomic_exchange_n(&mod->init_done, 1, __ATOMIC_ACQ_REL) != 0) return;
+void dbt_run_module_inits(dbt_module_t *mod, int argc,
+                          char *NM_NULLABLE_PTR *NM_NULLABLE_PTR argv,
+                          char *NM_NULLABLE_PTR *NM_NULLABLE_PTR envp) {
+    if (!mod || !atomic_load_explicit(&mod->in_use, memory_order_acquire)) return;
+    if (atomic_exchange_explicit(&mod->init_done, 1, memory_order_acq_rel) != 0) return;
 
     for (int i = 0; i < mod->num_deps; i++) {
         dbt_run_module_inits(mod->deps[i], argc, argv, envp);
@@ -1393,8 +1447,8 @@ void dbt_run_module_inits(dbt_module_t *mod, int argc, char **argv, char **envp)
 }
 
 void dbt_run_module_finis(dbt_module_t *mod) {
-    if (!mod || !__atomic_load_n(&mod->in_use, __ATOMIC_ACQUIRE)) return;
-    if (__atomic_exchange_n(&mod->fini_done, 1, __ATOMIC_ACQ_REL) != 0) return;
+    if (!mod || !atomic_load_explicit(&mod->in_use, memory_order_acquire)) return;
+    if (atomic_exchange_explicit(&mod->fini_done, 1, memory_order_acq_rel) != 0) return;
 
     if (mod->fini_array_va && mod->fini_array_sz >= 4) {
         uint32_t n = mod->fini_array_sz / 4u;
@@ -1402,19 +1456,19 @@ void dbt_run_module_finis(dbt_module_t *mod) {
         for (uint32_t i = n; i > 0; i--) {
             uint32_t fn = arr[i - 1];
             if (fn != 0 && fn != 0xFFFFFFFFu) {
-                newminhh_dbt_invoke_guest(fn, 0, NULL);
+                newminhh_dbt_invoke_guest(fn, 0, nullptr);
             }
         }
     }
     if (mod->fini_va) {
-        newminhh_dbt_invoke_guest(mod->fini_va, 0, NULL);
+        newminhh_dbt_invoke_guest(mod->fini_va, 0, nullptr);
     }
 }
 
 void dbt_run_all_module_finis(void) {
     for (int i = DBT_MAX_MODULES - 1; i >= 0; i--) {
-        if (__atomic_load_n(&g_modules[i].in_use, __ATOMIC_ACQUIRE) &&
-            !__atomic_load_n(&g_modules[i].fini_done, __ATOMIC_ACQUIRE)) {
+        if (atomic_load_explicit(&g_modules[i].in_use, memory_order_acquire) &&
+            !atomic_load_explicit(&g_modules[i].fini_done, memory_order_acquire)) {
             dbt_run_module_finis(&g_modules[i]);
         }
     }
@@ -1429,7 +1483,7 @@ void *newminhh_dbt_dlopen(const char *path, int flags) {
     dbt_ensure_initialized();
     if (!path || path[0] == '\0') {
         dbt_set_dlerror("newminhh_dbt_dlopen: NULL or empty path");
-        return NULL;
+        return nullptr;
     }
 
     pthread_mutex_lock(&g_loader_lock);
@@ -1441,11 +1495,11 @@ void *newminhh_dbt_dlopen(const char *path, int flags) {
     }
     pthread_mutex_unlock(&g_loader_lock);
 
-    uint8_t *buf = NULL;
+    uint8_t *buf = nullptr;
     size_t sz = 0;
     if (read_entire_file(path, &buf, &sz) != NM_OK) {
         dbt_set_dlerror("newminhh_dbt_dlopen: failed to read '%s'", path);
-        return NULL;
+        return nullptr;
     }
 
     pthread_mutex_lock(&g_loader_lock);
@@ -1461,10 +1515,10 @@ void *newminhh_dbt_dlopen(const char *path, int flags) {
     free(buf);
     if (rc != NM_OK) {
         dbt_set_dlerror("newminhh_dbt_dlopen: failed to load '%s' (err=%d)", path, rc);
-        return NULL;
+        return nullptr;
     }
 
-    dbt_run_module_inits(mod, 0, NULL, environ);
+    dbt_run_module_inits(mod, 0, nullptr, environ);
     return mod;
 }
 
@@ -1503,7 +1557,7 @@ void *newminhh_dbt_dlsym(void *handle, const char *sym) {
     dbt_ensure_initialized();
     if (!sym || sym[0] == '\0') {
         dbt_set_dlerror("newminhh_dbt_dlsym: empty symbol name");
-        return NULL;
+        return nullptr;
     }
 
     dbt_module_t *mod = (dbt_module_t *)handle;
@@ -1513,7 +1567,7 @@ void *newminhh_dbt_dlsym(void *handle, const char *sym) {
         pthread_mutex_unlock(&g_loader_lock);
         dbt_set_dlerror("newminhh_dbt_dlsym: invalid module handle %p for '%s'",
                         handle, sym);
-        return NULL;
+        return nullptr;
     }
 
     uint32_t va = 0;
@@ -1523,7 +1577,7 @@ void *newminhh_dbt_dlsym(void *handle, const char *sym) {
         snprintf(mod_path, sizeof(mod_path), "%s", mod->path);
         pthread_mutex_unlock(&g_loader_lock);
         dbt_set_dlerror("newminhh_dbt_dlsym: symbol '%s' not found in '%s'", sym, mod_path);
-        return NULL;
+        return nullptr;
     }
     if (!is_func) {
         pthread_mutex_unlock(&g_loader_lock);
@@ -1537,11 +1591,11 @@ void *newminhh_dbt_dlsym(void *handle, const char *sym) {
             return tr;
         }
     }
-    void *tramp = newminhh_alloc_cb_trampoline(va, NULL, NM_CB_MODE_DBT, NM_CB_FLAG_UNTYPED);
+    void *tramp = newminhh_alloc_cb_trampoline(va, nullptr, NM_CB_MODE_DBT, NM_CB_FLAG_UNTYPED);
     if (tramp) {
         int placed = 0;
         for (int i = 0; i < g_dlsym_cache_n; i++) {
-            if (g_dlsym_cache[i].mod == NULL) {
+            if (g_dlsym_cache[i].mod == nullptr) {
                 g_dlsym_cache[i] = (dbt_dlsym_cache_entry_t){mod, va, tramp};
                 placed = 1;
                 break;
@@ -1554,7 +1608,7 @@ void *newminhh_dbt_dlsym(void *handle, const char *sym) {
     pthread_mutex_unlock(&g_loader_lock);
     if (!tramp) {
         dbt_set_dlerror("newminhh_dbt_dlsym: failed to allocate trampoline for '%s'", sym);
-        return NULL;
+        return nullptr;
     }
     return tramp;
 }
@@ -1586,13 +1640,13 @@ int newminhh_dbt_dlclose(void *handle) {
     dbt_invalidate_cache_range(map_base, map_size);
 
     pthread_mutex_lock(&g_loader_lock);
-    __atomic_store_n(&mod->num_rx_ranges, 0, __ATOMIC_RELEASE);
-    __atomic_store_n(&mod->in_use, 0, __ATOMIC_RELEASE);
+    atomic_store_explicit(&mod->num_rx_ranges, 0, memory_order_release);
+    atomic_store_explicit(&mod->in_use, 0, memory_order_release);
     for (int i = 0; i < g_dlsym_cache_n; i++) {
         if (g_dlsym_cache[i].mod == mod) {
-            g_dlsym_cache[i].mod = NULL;
+            g_dlsym_cache[i].mod = nullptr;
             g_dlsym_cache[i].guest_va = 0;
-            g_dlsym_cache[i].trampoline = NULL;
+            g_dlsym_cache[i].trampoline = nullptr;
         }
     }
     if (map_base && map_size) {
@@ -1616,7 +1670,7 @@ int newminhh_dbt_dlclose(void *handle) {
 /* Guest-code dlopen/dlsym/dlclose (returns guest-callable stubs or raw guest VAs!) */
 uint32_t dbt_guest_dlopen(const char *filename, int flags) {
     (void)flags;
-    if (filename == NULL) {
+    if (filename == nullptr) {
         /* Main executable handle */
         pthread_mutex_lock(&g_loader_lock);
         for (int i = 0; i < DBT_MAX_DL_HANDLES; i++) {
@@ -1624,7 +1678,7 @@ uint32_t dbt_guest_dlopen(const char *filename, int flags) {
                 g_guest_dl_handles[i].in_use = 1;
                 g_guest_dl_handles[i].is_native = 0;
                 g_guest_dl_handles[i].guest_mod = g_main_mod;
-                g_guest_dl_handles[i].compat_handle = NULL;
+                g_guest_dl_handles[i].compat_handle = nullptr;
                 if (g_main_mod) g_main_mod->refcount++;
                 uint32_t h = (uint32_t)(uintptr_t)&g_guest_dl_handles[i];
                 pthread_mutex_unlock(&g_loader_lock);
@@ -1654,7 +1708,7 @@ uint32_t dbt_guest_dlopen(const char *filename, int flags) {
                 g_guest_dl_handles[i].in_use = 1;
                 g_guest_dl_handles[i].is_native = 1;
                 g_guest_dl_handles[i].compat_handle = ch;
-                g_guest_dl_handles[i].guest_mod = NULL;
+                g_guest_dl_handles[i].guest_mod = nullptr;
                 uint32_t h = (uint32_t)(uintptr_t)&g_guest_dl_handles[i];
                 pthread_mutex_unlock(&g_loader_lock);
                 return h;
@@ -1676,7 +1730,7 @@ uint32_t dbt_guest_dlopen(const char *filename, int flags) {
             g_guest_dl_handles[i].in_use = 1;
             g_guest_dl_handles[i].is_native = 0;
             g_guest_dl_handles[i].guest_mod = (dbt_module_t *)gm;
-            g_guest_dl_handles[i].compat_handle = NULL;
+            g_guest_dl_handles[i].compat_handle = nullptr;
             uint32_t h = (uint32_t)(uintptr_t)&g_guest_dl_handles[i];
             pthread_mutex_unlock(&g_loader_lock);
             return h;
@@ -1746,8 +1800,8 @@ int dbt_guest_dlclose(uint32_t handle) {
     void *ch = dh->compat_handle;
     dbt_module_t *gm = dh->guest_mod;
     dh->in_use = 0;
-    dh->compat_handle = NULL;
-    dh->guest_mod = NULL;
+    dh->compat_handle = nullptr;
+    dh->guest_mod = nullptr;
     pthread_mutex_unlock(&g_loader_lock);
 
     if (is_native) {

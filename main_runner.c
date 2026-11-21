@@ -15,7 +15,7 @@ static void print_usage(const char *prog) {
             prog, prog);
 }
 
-int main(int argc, char **argv) {
+int main(int argc, char *argv[]) {
     if (argc < 2) {
         print_usage(argv[0]);
         return 2;
@@ -49,15 +49,15 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        uint32_t args[6] = {0};
+        uint32_t args[6] = {};
         int nargs = argc - 4;
         if (nargs > 6) nargs = 6;
         for (int i = 0; i < nargs; i++) {
-            args[i] = (uint32_t)strtol(argv[4 + i], NULL, 0);
+            args[i] = (uint32_t)strtol(argv[4 + i], nullptr, 0);
         }
 
         typedef int (*fn6_t)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
-        fn6_t fn = (fn6_t)fn_ptr;
+        fn6_t fn = NM_VOIDP_TO_FN(fn6_t, fn_ptr);
         int ret = fn(args[0], args[1], args[2], args[3], args[4], args[5]);
         newminhh_dbt_dlclose(handle);
         return ret;

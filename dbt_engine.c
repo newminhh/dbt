@@ -22,7 +22,7 @@
 #define DBT_EDGE_MAP_MASK  (DBT_EDGE_MAP_SIZE - 1u)
 #define DBT_THREAD_STACK_SZ (2u * 1024u * 1024u)
 
-_Alignas(8) dbt_fast_entry_t g_dbt_fast_cache[DBT_FAST_CACHE_SIZE];
+alignas(8) dbt_fast_entry_t g_dbt_fast_cache[DBT_FAST_CACHE_SIZE];
 
 typedef struct dbt_block_node {
     uint32_t guest_eip;
@@ -42,7 +42,7 @@ typedef struct dbt_patched_edge {
 } dbt_patched_edge_t;
 
 static pthread_mutex_t g_jit_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint8_t *g_jit_cur = NULL;
+static uint8_t *g_jit_cur = nullptr;
 static size_t   g_jit_rem = 0;
 static dbt_block_node_t *g_block_buckets[DBT_BLOCK_MAP_SIZE];
 static dbt_patched_edge_t *g_edge_buckets[DBT_EDGE_MAP_SIZE];
@@ -52,16 +52,16 @@ static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
 static struct sigaction g_prev_segv;
 
 #define DBT_SEGV_CB_CAP 1024
-static uint32_t g_segv_vas[DBT_SEGV_CB_CAP];
-static uint8_t *g_segv_tramp_page = NULL;
+static _Atomic uint32_t g_segv_vas[DBT_SEGV_CB_CAP];
+static _Atomic(uint8_t *) g_segv_tramp_page = nullptr;
 
 /* Per-thread CPU & guest stack cleanup */
-static __thread newminhh_cpu_t tls_cpu;
-static __thread uint32_t tls_stack_base = 0;
-static __thread uint32_t tls_stack_size = 0;
-static __thread uint32_t tls_gs_alloc_base = 0;
-static __thread uint32_t tls_gs_alloc_size = 0;
-static __thread int tls_stack_key_set = 0;
+static thread_local newminhh_cpu_t tls_cpu;
+static thread_local uint32_t tls_stack_base = 0;
+static thread_local uint32_t tls_stack_size = 0;
+static thread_local uint32_t tls_gs_alloc_base = 0;
+static thread_local uint32_t tls_gs_alloc_size = 0;
+static thread_local int tls_stack_key_set = 0;
 static pthread_key_t g_tls_stack_key;
 
 typedef struct {
@@ -71,7 +71,7 @@ typedef struct {
     uint32_t gs_alloc_size;
 } tls_stack_cleanup_t;
 
-static __thread tls_stack_cleanup_t *tls_cleanup_rec = NULL;
+static thread_local tls_stack_cleanup_t *tls_cleanup_rec = nullptr;
 
 static void tls_stack_destructor(void *ptr) {
     tls_stack_cleanup_t *c = (tls_stack_cleanup_t *)ptr;
@@ -117,7 +117,7 @@ uint32_t dbt_ensure_thread_tls_and_stack(newminhh_cpu_t *cpu, uint32_t min_stack
         if (syscall(__NR_arch_prctl, ARCH_GET_GS, &cur_gs) == 0 && cur_gs != 0) {
             cpu->gs_base = (uint32_t)cur_gs;
         } else {
-            uint32_t gs = dbt_init_tls_block(NULL);
+            uint32_t gs = dbt_init_tls_block(nullptr);
             cpu->gs_base = gs;
             if (gs >= 8192u && tls_gs_alloc_base == 0) {
                 tls_gs_alloc_base = gs - 8192u;
@@ -129,7 +129,7 @@ uint32_t dbt_ensure_thread_tls_and_stack(newminhh_cpu_t *cpu, uint32_t min_stack
     if (cpu->gpr[NM_REG_ESP] == 0) {
         uint32_t sz = min_stack_size ? min_stack_size : DBT_THREAD_STACK_SZ;
         if (tls_stack_base == 0) {
-            void *stk = mmap(NULL, sz, PROT_READ | PROT_WRITE,
+            void *stk = mmap(nullptr, sz, PROT_READ | PROT_WRITE,
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (stk != MAP_FAILED) {
                 tls_stack_base = (uint32_t)(uintptr_t)stk;
@@ -156,12 +156,12 @@ void *dbt_alloc_jit_mem(size_t size) {
     pthread_mutex_lock(&g_jit_lock);
     if (!g_jit_cur || g_jit_rem < aligned) {
         size_t chunk = (aligned > DBT_JIT_CHUNK_SIZE) ? ((aligned + 4095u) & ~(size_t)4095u) : DBT_JIT_CHUNK_SIZE;
-        void *mem = mmap(NULL, chunk, PROT_READ | PROT_WRITE | PROT_EXEC,
+        void *mem = mmap(nullptr, chunk, PROT_READ | PROT_WRITE | PROT_EXEC,
                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mem == MAP_FAILED) {
             pthread_mutex_unlock(&g_jit_lock);
             NM_LOG_ERROR("dbt", "JIT mmap(%zu) failed: errno=%d", chunk, errno);
-            return NULL;
+            return nullptr;
         }
         g_jit_cur = (uint8_t *)mem;
         g_jit_rem = chunk;
@@ -213,10 +213,10 @@ void dbt_invalidate_cache_range(uint32_t start_va, uint32_t size) {
     pthread_mutex_unlock(&g_jit_lock);
 
     for (int i = 0; i < DBT_SEGV_CB_CAP; i++) {
-        uint32_t gva = __atomic_load_n(&g_segv_vas[i], __ATOMIC_ACQUIRE);
+        uint32_t gva = atomic_load_explicit(&g_segv_vas[i], memory_order_acquire);
         if (gva != 0 && (uint64_t)gva >= start64 && (uint64_t)gva < end64) {
-            __atomic_compare_exchange_n(&g_segv_vas[i], &gva, 0u,
-                                            0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+            atomic_compare_exchange_strong_explicit(&g_segv_vas[i], &gva, 0u,
+                                                    memory_order_acq_rel, memory_order_acquire);
         }
     }
 }
@@ -244,16 +244,16 @@ static void *dbt_lookup_or_translate(uint32_t guest_eip, int is_stub, uint32_t s
     }
     pthread_mutex_unlock(&g_jit_lock);
 
-    void *host_code = NULL;
+    void *host_code = nullptr;
     uint32_t guest_end = guest_eip;
     size_t host_size = 0;
     if (dbt_translate_block(guest_eip, is_stub, stub_id,
                             &host_code, &guest_end, &host_size) != NM_OK) {
-        return NULL;
+        return nullptr;
     }
 
     pthread_mutex_lock(&g_jit_lock);
-    dbt_block_node_t *reuse_node = NULL;
+    dbt_block_node_t *reuse_node = nullptr;
     for (dbt_block_node_t *n = g_block_buckets[bidx]; n; n = n->next) {
         if (n->valid && n->guest_eip == guest_eip) {
             void *existing = n->host_code;
@@ -302,11 +302,11 @@ uint64_t dbt_segv_cb_dispatch(uint32_t slot_id,
     if (slot_id >= DBT_SEGV_CB_CAP) {
         return 0;
     }
-    uint32_t gva = __atomic_load_n(&g_segv_vas[slot_id], __ATOMIC_ACQUIRE);
+    uint32_t gva = atomic_load_explicit(&g_segv_vas[slot_id], memory_order_acquire);
     if (gva == 0) {
         return 0;
     }
-    return newminhh_in_bridge(gva, NULL, gprs, xmms, caller_stack, NM_CB_MODE_DBT, out_fp);
+    return newminhh_in_bridge(gva, nullptr, gprs, xmms, caller_stack, NM_CB_MODE_DBT, out_fp);
 }
 
 static void emit_segv_tramp_slot(uint8_t *slot, uint32_t slot_id, uintptr_t target) {
@@ -345,7 +345,7 @@ static void init_segv_tramp_pool(void) {
     uint8_t *mem = (uint8_t *)mmap(hint, page_sz, PROT_READ | PROT_WRITE,
                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mem == MAP_FAILED) {
-        mem = (uint8_t *)mmap(NULL, page_sz, PROT_READ | PROT_WRITE,
+        mem = (uint8_t *)mmap(nullptr, page_sz, PROT_READ | PROT_WRITE,
                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     }
     if (mem == MAP_FAILED) {
@@ -360,7 +360,7 @@ static void init_segv_tramp_pool(void) {
         munmap(mem, page_sz);
         return;
     }
-    __atomic_store_n(&g_segv_tramp_page, mem, __ATOMIC_RELEASE);
+    atomic_store_explicit(&g_segv_tramp_page, mem, memory_order_release);
 }
 
 static void dbt_sigsegv_handler(int sig, siginfo_t *si, void *uctx_raw) {
@@ -369,13 +369,13 @@ static void dbt_sigsegv_handler(int sig, siginfo_t *si, void *uctx_raw) {
     if (si && uc && si->si_code == SEGV_ACCERR) {
         uint64_t rip64 = (uint64_t)uc->uc_mcontext.gregs[REG_RIP];
         uint64_t faddr = (uint64_t)(uintptr_t)si->si_addr;
-        uint8_t *tramp_page = __atomic_load_n(&g_segv_tramp_page, __ATOMIC_ACQUIRE);
+        uint8_t *tramp_page = atomic_load_explicit(&g_segv_tramp_page, memory_order_acquire);
         if (tramp_page && rip64 == faddr && rip64 < 0x100000000ULL &&
             dbt_is_guest_rx_va((uint32_t)rip64)) {
             uint32_t gva = (uint32_t)rip64;
             int slot = -1;
             for (int i = 0; i < DBT_SEGV_CB_CAP; i++) {
-                if (__atomic_load_n(&g_segv_vas[i], __ATOMIC_ACQUIRE) == gva) {
+                if (atomic_load_explicit(&g_segv_vas[i], memory_order_acquire) == gva) {
                     slot = i;
                     break;
                 }
@@ -383,8 +383,8 @@ static void dbt_sigsegv_handler(int sig, siginfo_t *si, void *uctx_raw) {
             if (slot < 0) {
                 for (int i = 0; i < DBT_SEGV_CB_CAP; i++) {
                     uint32_t expected = 0;
-                    if (__atomic_compare_exchange_n(&g_segv_vas[i], &expected, gva,
-                                                    0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                    if (atomic_compare_exchange_strong_explicit(&g_segv_vas[i], &expected, gva,
+                                                                memory_order_acq_rel, memory_order_acquire)) {
                         slot = i;
                         break;
                     }
@@ -410,7 +410,7 @@ static void dbt_sigsegv_handler(int sig, siginfo_t *si, void *uctx_raw) {
     if (g_prev_segv.sa_handler == SIG_IGN) {
         return;
     }
-    if (g_prev_segv.sa_handler != SIG_DFL && g_prev_segv.sa_handler != NULL) {
+    if (g_prev_segv.sa_handler != SIG_DFL && g_prev_segv.sa_handler != nullptr) {
         g_prev_segv.sa_handler(SIGSEGV);
         return;
     }
@@ -418,7 +418,7 @@ static void dbt_sigsegv_handler(int sig, siginfo_t *si, void *uctx_raw) {
     memset(&dfl, 0, sizeof(dfl));
     dfl.sa_handler = SIG_DFL;
     sigemptyset(&dfl.sa_mask);
-    sigaction(SIGSEGV, &dfl, NULL);
+    sigaction(SIGSEGV, &dfl, nullptr);
 }
 
 static void dbt_init_once(void) {
@@ -493,7 +493,7 @@ static int dbt_guest_invoker_cb(uint32_t guest_fn_va,
 
 uint32_t newminhh_dbt_invoke_guest(uint32_t guest_fn_va, int nargs, const uint32_t *args) {
     uint64_t res = 0;
-    dbt_guest_invoker_cb(guest_fn_va, NULL, args, nargs, &res, NULL);
+    dbt_guest_invoker_cb(guest_fn_va, nullptr, args, nargs, &res, nullptr);
     return (uint32_t)res;
 }
 
@@ -509,7 +509,7 @@ static int is_guest_elf_file(const char *path) {
     return (eh.e_ident[EI_CLASS] == ELFCLASS32 && eh.e_machine == EM_386);
 }
 
-__attribute__((constructor))
+NM_CONSTRUCTOR
 static void dbt_register_backends(void) {
     nm_dl_backend_t dl_be = {
         .dlopen_fn = newminhh_dbt_dlopen,
@@ -525,7 +525,7 @@ static void dbt_register_backends(void) {
 static void report_unsupported_insn(uint32_t eip) {
     csh h = 0;
     if (cs_open(CS_ARCH_X86, CS_MODE_32, &h) == CS_ERR_OK) {
-        cs_insn *insn = NULL;
+        cs_insn *insn = nullptr;
         size_t n = cs_disasm(h, (const uint8_t *)(uintptr_t)eip, 15, eip, 1, &insn);
         if (n == 1) {
             char hex[64] = {0};
@@ -609,7 +609,7 @@ static int dbt_handle_compat_stub(newminhh_cpu_t *cpu, uint32_t stub_id,
         uint32_t ret = newminhh_dbt_invoke_guest(main_va, 3, margs);
         newminhh_run_guest_atexits();
         dbt_run_all_module_finis();
-        fflush(NULL);
+        fflush(nullptr);
         *out_should_stop = 1;
         *out_exit_code = (int)(int32_t)ret;
         return NM_OK;
@@ -618,7 +618,7 @@ static int dbt_handle_compat_stub(newminhh_cpu_t *cpu, uint32_t stub_id,
         int status = (int)cdecl_args[0];
         newminhh_run_guest_atexits();
         dbt_run_all_module_finis();
-        fflush(NULL);
+        fflush(nullptr);
         exit(status);
     }
     case DBT_STUB_ATEXIT:
@@ -636,7 +636,7 @@ static int dbt_handle_compat_stub(newminhh_cpu_t *cpu, uint32_t stub_id,
         const nm_sym_entry_t *sym = &se->sym;
         if (sym->flags & NM_SYM_FLAG_CDECL_DIRECT) {
             typedef int (*cdecl_direct_t)(const uint32_t *);
-            cdecl_direct_t fn = (cdecl_direct_t)sym->wrapper_fn;
+            cdecl_direct_t fn = NM_VOIDP_TO_FN(cdecl_direct_t, sym->wrapper_fn);
             int r = fn(cdecl_args);
             cpu->gpr[NM_REG_EAX] = (uint32_t)r;
         } else {
@@ -742,7 +742,7 @@ int dbt_run_cpu_loop(newminhh_cpu_t *cpu, int allow_unregistered_va) {
                         }
                     }
                     if (target_valid) {
-                        dbt_patched_edge_t *edge = NULL;
+                        dbt_patched_edge_t *edge = nullptr;
                         for (dbt_patched_edge_t *it = g_edge_buckets[eb]; it; it = it->next) {
                             if (it->patch_site_va == patch_site_va) {
                                 edge = it;
@@ -854,7 +854,7 @@ int newminhh_dbt_exec_file(const char *path, int argc, char **argv, char **envp)
         NM_LOG_ERROR("dbt", "exec_file: NULL or empty path");
         return NM_ERR_ELF;
     }
-    dbt_module_t *mod = NULL;
+    dbt_module_t *mod = nullptr;
     int rc = dbt_load_main_file(path, &mod);
     if (rc != NM_OK) {
         return rc;
@@ -869,7 +869,7 @@ int newminhh_dbt_exec_embedded(const void *orig_elf_blob, size_t blob_size,
         NM_LOG_ERROR("dbt", "exec_embedded: NULL or empty ELF blob");
         return NM_ERR_ELF;
     }
-    dbt_module_t *mod = NULL;
+    dbt_module_t *mod = nullptr;
     errno = 0;
     int rc = dbt_load_main_memory(orig_elf_blob, blob_size, "<embedded>", &mod);
     if (rc != NM_OK) {
@@ -889,13 +889,13 @@ int newminhh_dbt_exec_embedded(const void *orig_elf_blob, size_t blob_size,
     return exec_loaded_main(mod, target_va, argc, argv, envp ? envp : environ);
 }
 
-int newminhh_dbt_enter_at(uint32_t guest_va, newminhh_cpu_t *cpu) {
+int newminhh_dbt_enter_at(uint32_t guest_va, newminhh_cpu_t *NM_NULLABLE_PTR cpu) {
     dbt_ensure_initialized();
     if (guest_va == 0) {
         NM_LOG_ERROR("dbt", "enter_at: NULL guest_va");
         return NM_ERR_INSN;
     }
-    if (cpu != NULL) {
+    if (cpu != nullptr) {
         int had_esp = (cpu->gpr[NM_REG_ESP] != 0);
         dbt_ensure_thread_tls_and_stack(cpu, DBT_THREAD_STACK_SZ);
         if (!had_esp) {
