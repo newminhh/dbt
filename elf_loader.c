@@ -10,7 +10,7 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <stdatomic.h>
-#include <stdbit.h>
+#include "newminhh_lookup.h"
 #include <stdckdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -118,8 +118,8 @@ static inline uint32_t page_up(uint32_t v) {
 
 static uint32_t align_up(uint32_t v, uint32_t align) {
     if (align <= 1u) return v;
-    if (!stdc_has_single_bit(align)) {
-        align = stdc_bit_ceil(align);
+    if (!NM_HAS_SINGLE_BIT(align)) {
+        align = NM_BIT_CEIL(align);
     }
     uint32_t res = 0;
     if (ckd_add(&res, v, align - 1u)) {
@@ -301,11 +301,60 @@ static void cleanup_brk_arena(void) {
     pthread_mutex_unlock(&g_brk_lock);
 }
 
-static int is_canonical_system_lib(const char *name) {
-    if (!name) return 0;
+/* Weak declarations so elf_loader.c links cleanly even if libnewminhh_compat
+ * has not yet exported lookup symbols in some build configurations. */
+[[gnu::weak]] int newminhh_lookup_classify_lib(const char *NM_NONNULL_PTR soname,
+                                               char *NM_NULLABLE_PTR tgt_out,
+                                               size_t tgt_sz);
+
+[[gnu::weak]] int newminhh_lookup_resolve(const char *NM_NULLABLE_PTR soname,
+                                          const char *NM_NONNULL_PTR sym,
+                                          const char *NM_NULLABLE_PTR ver,
+                                          nm_sym_entry_t *NM_NONNULL_PTR out,
+                                          void *NM_NULLABLE_PTR *NM_NULLABLE_PTR native_handle);
+
+/* Per-module native x32 dependency tracking */
+typedef struct {
+    char native_deps[DBT_MAX_DEPS][128];
+    void *native_handles[DBT_MAX_DEPS];
+    int num_native_deps;
+} dbt_module_native_t;
+
+static dbt_module_native_t g_mod_native[DBT_MAX_MODULES];
+
+static inline dbt_module_native_t *get_mod_native(const dbt_module_t *mod) {
+    if (!mod || mod < g_modules || mod >= g_modules + DBT_MAX_MODULES) return nullptr;
+    return &g_mod_native[mod - g_modules];
+}
+
+static void clear_mod_native_locked(dbt_module_t *mod) {
+    dbt_module_native_t *mn = get_mod_native(mod);
+    if (!mn) return;
+    for (int i = 0; i < DBT_MAX_DEPS; i++) {
+        if (mn->native_handles[i]) {
+            dlclose(mn->native_handles[i]);
+            mn->native_handles[i] = nullptr;
+        }
+    }
+    memset(mn, 0, sizeof(*mn));
+}
+
+static int dbt_classify_library(const char *name, char *tgt_out, size_t tgt_sz) {
+    if (!name || name[0] == '\0') return NM_LK_NONE;
     const char *base = strrchr(name, '/');
     base = base ? (base + 1) : name;
-    static const char *const sys_libs[] = {
+
+    int cls = NM_LK_NONE;
+    if (newminhh_lookup_classify_lib != nullptr) {
+        cls = newminhh_lookup_classify_lib(base, tgt_out, tgt_sz);
+        if (cls != NM_LK_NONE) {
+            return cls;
+        }
+    }
+
+    /* Fallback canonical system libraries: glibc + musl SONAMEs */
+    static const char *const fallback_compat_libs[] = {
+        /* glibc */
         "libc.so.6", "libc.so",
         "libm.so.6", "libm.so",
         "libpthread.so.0", "libpthread.so",
@@ -313,12 +362,26 @@ static int is_canonical_system_lib(const char *name) {
         "librt.so.1", "librt.so",
         "libgcc_s.so.1",
         "libstdc++.so.6",
-        "ld-linux.so.2"
+        "ld-linux.so.2",
+        /* musl */
+        "libc.musl-x32.so.1",
+        "ld-musl-x32.so.1"
     };
-    for (size_t i = 0; i < NM_COUNTOF(sys_libs); i++) {
-        if (strcmp(base, sys_libs[i]) == 0) return 1;
+    for (size_t i = 0; i < NM_COUNTOF(fallback_compat_libs); i++) {
+        if (strcmp(base, fallback_compat_libs[i]) == 0) {
+            return NM_LK_COMPAT;
+        }
     }
-    return 0;
+    return NM_LK_NONE;
+}
+
+static const char *extract_sym_ver(const char *name) {
+    if (!name) return nullptr;
+    const char *at = strchr(name, '@');
+    if (!at) return nullptr;
+    at++;
+    if (*at == '@') at++;
+    return (*at != '\0') ? at : nullptr;
 }
 
 static int strip_sym_ver(const char *name, char *out, size_t out_sz) {
@@ -686,6 +749,36 @@ static int apply_reloc_table(dbt_module_t *mod, const void *tbl_ptr, uint32_t tb
                     /* Ensure stdio globals are initialized */
                     FILE *fi = nullptr, *fo = nullptr, *fe = nullptr;
                     newminhh_get_stdio_streams(&fi, &fo, &fe);
+                } else if (newminhh_lookup_resolve != nullptr) {
+                    const char *ver = extract_sym_ver(raw_name);
+                    dbt_module_native_t *mn = get_mod_native(mod);
+                    int num_ndeps = mn ? mn->num_native_deps : 0;
+                    int total_tries = num_ndeps + 1;
+                    for (int d = 0; d < total_tries; d++) {
+                        const char *dep_soname = (d < num_ndeps) ? mn->native_deps[d] : nullptr;
+                        void *native_h = nullptr;
+                        memset(&ce, 0, sizeof(ce));
+                        int lk_rc = newminhh_lookup_resolve(dep_soname, clean_name, ver, &ce, &native_h);
+                        if (lk_rc == NM_OK && (ce.flags & NM_SYM_FLAG_DATA)) {
+                            resolved = 1;
+                            is_compat_data = 1;
+                            compat_data_ptr = ce.wrapper_fn;
+                            S = (uint32_t)(uintptr_t)ce.wrapper_fn;
+                            if (native_h && mn) {
+                                if (d < num_ndeps && mn->native_handles[d] == nullptr) {
+                                    mn->native_handles[d] = native_h;
+                                } else {
+                                    for (int h = 0; h < DBT_MAX_DEPS; h++) {
+                                        if (mn->native_handles[h] == nullptr) {
+                                            mn->native_handles[h] = native_h;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
                 }
             }
         } else {
@@ -714,6 +807,52 @@ static int apply_reloc_table(dbt_module_t *mod, const void *tbl_ptr, uint32_t tb
                     } else {
                         S = dbt_alloc_stub_for_sym(clean_name, &ce);
                         if (S == 0) return NM_ERR_DLSYM;
+                    }
+                } else if (newminhh_lookup_resolve != nullptr) {
+                    const char *ver = extract_sym_ver(raw_name);
+                    dbt_module_native_t *mn = get_mod_native(mod);
+                    int num_ndeps = mn ? mn->num_native_deps : 0;
+                    int total_tries = num_ndeps + 1;
+                    for (int d = 0; d < total_tries; d++) {
+                        const char *dep_soname = (d < num_ndeps) ? mn->native_deps[d] : nullptr;
+                        void *native_h = nullptr;
+                        memset(&ce, 0, sizeof(ce));
+                        int lk_rc = newminhh_lookup_resolve(dep_soname, clean_name, ver, &ce, &native_h);
+                        if (lk_rc == NM_OK) {
+                            if (ce.flags & NM_CB_FLAG_UNTYPED) {
+                                NM_LOG_ERROR("elf", "'%s': symbol '%s' from '%s' has UNTYPED ABI",
+                                             mod->path, clean_name, dep_soname ? dep_soname : "<wildcard>");
+                                dbt_set_dlerror("symbol '%s' from '%s' has UNTYPED ABI",
+                                                clean_name, dep_soname ? dep_soname : "<wildcard>");
+                                return NM_ERR_ABI;
+                            }
+                            resolved = 1;
+                            if (native_h && mn) {
+                                if (d < num_ndeps && mn->native_handles[d] == nullptr) {
+                                    mn->native_handles[d] = native_h;
+                                } else {
+                                    for (int h = 0; h < DBT_MAX_DEPS; h++) {
+                                        if (mn->native_handles[h] == nullptr) {
+                                            mn->native_handles[h] = native_h;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (ce.flags & NM_SYM_FLAG_DATA) {
+                                S = (uint32_t)(uintptr_t)ce.wrapper_fn;
+                            } else {
+                                S = dbt_alloc_stub_for_sym(clean_name, &ce);
+                                if (S == 0) return NM_ERR_DLSYM;
+                            }
+                            break;
+                        } else if (lk_rc == NM_ERR_ABI) {
+                            NM_LOG_ERROR("elf", "'%s': symbol '%s' from '%s' explicitly rejected as UNTYPED or FORBIDDEN_ABI",
+                                         mod->path, clean_name, dep_soname ? dep_soname : "<wildcard>");
+                            dbt_set_dlerror("symbol '%s' from '%s' explicitly rejected as UNTYPED or FORBIDDEN_ABI",
+                                            clean_name, dep_soname ? dep_soname : "<wildcard>");
+                            return NM_ERR_ABI;
+                        }
                     }
                 }
             }
@@ -750,7 +889,12 @@ static int apply_reloc_table(dbt_module_t *mod, const void *tbl_ptr, uint32_t tb
                                  clean_name, mod->path);
                     return NM_ERR_DLSYM;
                 }
-                memcpy(P, src, (size_t)sym->st_size);
+                if (S_size > 0 && sym->st_size > S_size) {
+                    NM_LOG_WARN("elf", "R_386_COPY '%s' size mismatch: sym->st_size=%u > S_size=%u",
+                                clean_name, sym->st_size, S_size);
+                }
+                size_t copy_sz = (S_size > 0 && sym->st_size > S_size) ? (size_t)S_size : (size_t)sym->st_size;
+                memcpy(P, src, copy_sz);
             }
             break;
         default:
@@ -780,6 +924,7 @@ static void abort_loaded_dep_locked(dbt_module_t *dep) {
             g_next_dyn_hint = dep->map_base;
         }
     }
+    clear_mod_native_locked(dep);
     memset(dep, 0, sizeof(*dep));
     for (int i = 0; i < ndeps; i++) {
         abort_loaded_dep_locked(subdeps[i]);
@@ -977,6 +1122,7 @@ static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *pa
 
     dbt_module_t *mod = &g_modules[slot];
     memset(mod, 0, sizeof(*mod));
+    clear_mod_native_locked(mod);
     mod->refcount = 1;
     mod->is_main = is_main;
     snprintf(mod->path, sizeof(mod->path), "%s", path);
@@ -1183,7 +1329,93 @@ static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *pa
                 goto fail_cleanup;
             }
             const char *dep_name = mod->strtab + needed_offs[i];
-            if (is_canonical_system_lib(dep_name)) continue;
+            char tgt_buf[128] = {0};
+            int lib_cls = dbt_classify_library(dep_name, tgt_buf, sizeof(tgt_buf));
+
+            if (lib_cls == NM_LK_COMPAT) {
+                continue;
+            }
+
+            if (lib_cls == NM_LK_NATIVE_LIB) {
+                int has_bad_sym = 0;
+                char bad_sym_names[512] = {0};
+                size_t bad_len = 0;
+
+                if (newminhh_lookup_resolve != nullptr && mod->symtab && mod->nsyms > 0 && mod->strtab) {
+                    const Elf32_Sym *syms = (const Elf32_Sym *)mod->symtab;
+                    for (uint32_t s = 1; s < mod->nsyms; s++) {
+                        const Elf32_Sym *sym = &syms[s];
+                        if (sym->st_shndx != SHN_UNDEF) continue;
+                        if (sym->st_name >= mod->strsz) continue;
+                        if (ELF32_ST_BIND(sym->st_info) == STB_LOCAL) continue;
+
+                        const char *raw_name = mod->strtab + sym->st_name;
+                        if (!raw_name || raw_name[0] == '\0') continue;
+
+                        char clean_sym[256];
+                        strip_sym_ver(raw_name, clean_sym, sizeof(clean_sym));
+                        const char *ver = extract_sym_ver(raw_name);
+
+                        /* Skip weak CRT symbols and symbols already satisfied by compat wrappers */
+                        if (ELF32_ST_BIND(sym->st_info) == STB_WEAK &&
+                            (strcmp(clean_sym, "_ITM_deregisterTMCloneTable") == 0 ||
+                             strcmp(clean_sym, "_ITM_registerTMCloneTable") == 0 ||
+                             strcmp(clean_sym, "__gmon_start__") == 0 ||
+                             strcmp(clean_sym, "_Jv_RegisterClasses") == 0)) {
+                            continue;
+                        }
+
+                        nm_sym_entry_t ce;
+                        memset(&ce, 0, sizeof(ce));
+                        if (newminhh_compat_lookup_wrapper(clean_sym, &ce) == NM_OK) {
+                            continue;
+                        }
+                        int lk_rc = newminhh_lookup_resolve(dep_name, clean_sym, ver, &ce, nullptr);
+                        if (lk_rc == NM_OK) {
+                            if (ce.flags & NM_CB_FLAG_UNTYPED) {
+                                has_bad_sym = 1;
+                                if (bad_len + strlen(clean_sym) + 2 < sizeof(bad_sym_names)) {
+                                    if (bad_len > 0) {
+                                        bad_sym_names[bad_len++] = ',';
+                                        bad_sym_names[bad_len++] = ' ';
+                                    }
+                                    strcpy(bad_sym_names + bad_len, clean_sym);
+                                    bad_len += strlen(clean_sym);
+                                }
+                            }
+                        } else if (lk_rc == NM_ERR_ABI) {
+                            has_bad_sym = 1;
+                            if (bad_len + strlen(clean_sym) + 2 < sizeof(bad_sym_names)) {
+                                if (bad_len > 0) {
+                                    bad_sym_names[bad_len++] = ',';
+                                    bad_sym_names[bad_len++] = ' ';
+                                }
+                                strcpy(bad_sym_names + bad_len, clean_sym);
+                                bad_len += strlen(clean_sym);
+                            }
+                        }
+                    }
+                }
+
+                if (!has_bad_sym) {
+                    dbt_module_native_t *mn = get_mod_native(mod);
+                    if (mn && mn->num_native_deps < DBT_MAX_DEPS) {
+                        snprintf(mn->native_deps[mn->num_native_deps],
+                                 sizeof(mn->native_deps[0]), "%s", dep_name);
+                        mn->num_native_deps++;
+                    }
+                    continue;
+                }
+
+                char guest_so_path[512];
+                if (find_so_path(dep_name, path, guest_so_path, sizeof(guest_so_path)) != 0) {
+                    NM_LOG_ERROR("elf", "'%s': native library '%s' rejected due to untyped/forbidden ABI symbol(s): [%s] (and no i386 guest .so found)",
+                                 path, dep_name, bad_sym_names);
+                    dbt_set_dlerror("native library '%s' rejected due to untyped/forbidden ABI symbol(s): [%s]",
+                                    dep_name, bad_sym_names);
+                    goto fail_cleanup;
+                }
+            }
 
             if (mod->num_deps >= DBT_MAX_DEPS) {
                 NM_LOG_ERROR("elf", "'%s': exceeded DBT_MAX_DEPS (%d)", path, DBT_MAX_DEPS);
@@ -1251,6 +1483,7 @@ static int load_guest_blob(const uint8_t *blob, size_t blob_size, const char *pa
     return NM_OK;
 
 fail_cleanup_dlsym:
+    clear_mod_native_locked(mod);
     for (int i = 0; i < mod->num_deps; i++) {
         abort_loaded_dep_locked(mod->deps[i]);
     }
@@ -1265,6 +1498,7 @@ fail_cleanup_dlsym:
     return NM_ERR_DLSYM;
 
 fail_cleanup:
+    clear_mod_native_locked(mod);
     for (int i = 0; i < mod->num_deps; i++) {
         abort_loaded_dep_locked(mod->deps[i]);
     }
@@ -1656,6 +1890,7 @@ int newminhh_dbt_dlclose(void *handle) {
             g_next_dyn_hint = map_base;
         }
     }
+    clear_mod_native_locked(mod);
     memset(mod, 0, sizeof(*mod));
     pthread_mutex_unlock(&g_loader_lock);
 
@@ -1695,7 +1930,9 @@ uint32_t dbt_guest_dlopen(const char *filename, int flags) {
         return 0;
     }
 
-    if (is_canonical_system_lib(filename)) {
+    char tgt_buf[128];
+    int lib_cls = dbt_classify_library(filename, tgt_buf, sizeof(tgt_buf));
+    if (lib_cls == NM_LK_COMPAT || lib_cls == NM_LK_NATIVE_LIB) {
         void *ch = compat_dlopen(filename, flags);
         if (!ch) {
             const char *ce = compat_dlerror();
@@ -1759,7 +1996,19 @@ uint32_t dbt_guest_dlsym(uint32_t handle, const char *symbol) {
     if (dh->is_native) {
         pthread_mutex_unlock(&g_loader_lock);
         nm_sym_entry_t entry;
-        if (newminhh_compat_lookup_wrapper(symbol, &entry) != NM_OK) {
+        int found = 0;
+        if (newminhh_compat_lookup_wrapper(symbol, &entry) == NM_OK) {
+            found = 1;
+        } else if (newminhh_lookup_resolve != nullptr) {
+            void *native_h = nullptr;
+            memset(&entry, 0, sizeof(entry));
+            if (newminhh_lookup_resolve(nullptr, symbol, nullptr, &entry, &native_h) == NM_OK) {
+                if (!(entry.flags & NM_CB_FLAG_UNTYPED)) {
+                    found = 1;
+                }
+            }
+        }
+        if (!found) {
             dbt_set_dlerror("dbt_guest_dlsym: unsupported native symbol '%s' (no i386<->x32 ABI wrapper)",
                             symbol);
             return 0;

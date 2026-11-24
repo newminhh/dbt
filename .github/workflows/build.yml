@@ -19,46 +19,55 @@ jobs:
       - name: Checkout newminhh/dbt
         uses: actions/checkout@v4
         with:
-          path: dbt
+          path: src/dbt
 
       - name: Pull shared headers from newminhh/common
         uses: actions/checkout@v4
         with:
           repository: newminhh/common
-          path: common
+          path: src/common
+
+      - name: Pull lookup dependency from newminhh/lookup
+        uses: actions/checkout@v4
+        with:
+          repository: newminhh/lookup
+          path: src/lookup
 
       - name: Pull newminhh/compat dependency
         uses: actions/checkout@v4
         with:
           repository: newminhh/compat
-          path: compat
+          path: src/compat
 
       - name: Install bleeding-edge Clang, GCC, and Capstone
         run: |
           pacman -Syu --noconfirm --needed clang gcc binutils make capstone
 
-      - name: Build libnewminhh_compat prerequisite
+      - name: Build lookup and libnewminhh_compat prerequisites
         run: |
-          make -C compat clean all CC="clang" CSTD="gnu23"
+          make -C src/lookup clean all CC="clang"
+          make -C src/compat clean all CC="clang" CSTD="gnu23"
 
       - name: Validate C23 / C2y compilation matrix (Clang & GCC)
         run: |
           for cc in clang gcc; do
             for std in gnu23 gnu2y; do
               echo "=== Testing $cc with -std=$std ==="
-              make -C dbt clean all CC="$cc" CSTD="$std" LIBDIR="/usr/lib"
+              make -C src/lookup clean all CC="$cc"
+              make -C src/compat clean all CC="$cc" CSTD="$std"
+              make -C src/dbt clean all CC="$cc" CSTD="$std" LIBDIR="/usr/lib"
             done
           done
 
       - name: Run static analysis (make analyze)
         run: |
-          make -C dbt clean analyze CC="clang"
-          make -C dbt clean analyze CC="gcc"
+          make -C src/dbt clean analyze CC="clang"
+          make -C src/dbt clean analyze CC="gcc"
 
       - name: Verify -mx32 integrated assembly
         run: |
           for cc in clang gcc; do
-            $cc -mx32 -fPIC -Icommon -c dbt/dbt_trampolines.S -o /dev/null
+            $cc -mx32 -fPIC -I src/common -c src/dbt/dbt_trampolines.S -o /dev/null
           done
 
   ubuntu-x32-link-fallback:
@@ -67,24 +76,30 @@ jobs:
       - name: Checkout newminhh/dbt
         uses: actions/checkout@v4
         with:
-          path: dbt
+          path: src/dbt
 
       - name: Pull shared headers from newminhh/common
         uses: actions/checkout@v4
         with:
           repository: newminhh/common
-          path: common
+          path: src/common
+
+      - name: Pull lookup dependency from newminhh/lookup
+        uses: actions/checkout@v4
+        with:
+          repository: newminhh/lookup
+          path: src/lookup
 
       - name: Pull newminhh/compat dependency
         uses: actions/checkout@v4
         with:
           repository: newminhh/compat
-          path: compat
+          path: src/compat
 
       - name: Install x32 toolchain and build x32 Capstone
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-multilib libc6-dev-x32 binutils cmake git file
+          sudo apt-get install -y gcc-multilib libc6-dev-x32 binutils cmake git file make
           git clone --depth 1 --branch 5.0.3 https://github.com/capstone-engine/capstone.git /tmp/capstone
           cmake -S /tmp/capstone -B /tmp/capstone/build \
             -DCMAKE_C_FLAGS="-mx32 -O2 -fPIC" \
@@ -100,22 +115,23 @@ jobs:
           sudo cp -a /tmp/capstone/build/libcapstone.so* /usr/local/lib/x86_64-linux-gnux32/
           sudo cp -r /tmp/capstone/include/capstone /usr/local/include/
 
-      - name: Build libnewminhh_compat.so, libnewminhh_dbt.so, and newminhh-run (x32)
+      - name: Build lookup, libnewminhh_compat.so, libnewminhh_dbt.so, and newminhh-run (x32)
         run: |
-          make -C compat CC="gcc -mx32" CSTD="gnu23" all
-          make -C dbt CC="gcc -mx32" CSTD="gnu23" LIBDIR="/usr/local/lib/x86_64-linux-gnux32" all
-          file dbt/libnewminhh_dbt.so dbt/newminhh-run
-          readelf -h dbt/libnewminhh_dbt.so dbt/newminhh-run | grep -E "Class:.*ELF32|Machine:.*Advanced Micro Devices X86-64"
-          readelf -l dbt/newminhh-run | grep "0x70000000"
-          ! readelf -W -l dbt/libnewminhh_dbt.so | grep "GNU_STACK" | grep -q "RWE"
-          ! readelf -W -l dbt/newminhh-run | grep "GNU_STACK" | grep -q "RWE"
-          readelf -d dbt/libnewminhh_dbt.so | grep -E "BIND_NOW|FLAGS.*BIND_NOW"
-          readelf -d dbt/newminhh-run | grep -E "BIND_NOW|FLAGS.*BIND_NOW"
+          make -C src/lookup CC="gcc -mx32" all
+          make -C src/compat CC="gcc -mx32" CSTD="gnu23" all
+          make -C src/dbt CC="gcc -mx32" CSTD="gnu23" LIBDIR="/usr/local/lib/x86_64-linux-gnux32" all
+          file src/dbt/libnewminhh_dbt.so src/dbt/newminhh-run
+          readelf -h src/dbt/libnewminhh_dbt.so src/dbt/newminhh-run | grep -E "Class:.*ELF32|Machine:.*Advanced Micro Devices X86-64"
+          readelf -l src/dbt/newminhh-run | grep "0x70000000"
+          ! readelf -W -l src/dbt/libnewminhh_dbt.so | grep "GNU_STACK" | grep -q "RWE"
+          ! readelf -W -l src/dbt/newminhh-run | grep "GNU_STACK" | grep -q "RWE"
+          readelf -d src/dbt/libnewminhh_dbt.so | grep -E "BIND_NOW|FLAGS.*BIND_NOW"
+          readelf -d src/dbt/newminhh-run | grep -E "BIND_NOW|FLAGS.*BIND_NOW"
 
       - name: Upload dbt build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: newminhh-dbt-x32
           path: |
-            dbt/libnewminhh_dbt.so
-            dbt/newminhh-run
+            src/dbt/libnewminhh_dbt.so
+            src/dbt/newminhh-run

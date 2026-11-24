@@ -25,6 +25,7 @@ Executes unmodified i386 (`ELFCLASS32`, `EM_386`) executables and shared librari
 - **Strict NX-Guard on Guest Code**: Guest `PF_X` segments are mapped strictly `PROT_READ` (never `PROT_EXEC`). Raw native-to-guest calls into `PROT_READ` guest memory raise `SIGSEGV` (`SEGV_ACCERR`), which `dbt_sigsegv_handler` redirects locklessly to pre-allocated W^X trampolines (`dbt_segv_cb_entry`) while chaining non-guest segfaults to any pre-existing handler.
 - **High Link Address (`0x70000000`)**: Keeps `newminhh-run` above all guest `ET_EXEC` (`0x08048000`) and `ET_DYN` (`< 0x60000000`) virtual mappings.
 - **Fast Indirect Branch Cache & Direct Chaining**: Direct branches atomically patch `rel32` jumps once target blocks are translated (and unchain cleanly on `dbt_invalidate_cache_range`); indirect jumps/calls/returns probe `g_dbt_fast_cache[65536]` in 1 atomic 64-bit load inline inside JIT code.
+- **Lookup-Aware Resolution**: Resolves guest symbols/imports via [`newminhh/lookup`](../lookup/README.md) layered `lookup_table.txt` precedence (static curated/base + optional dynamic cache) for ABI-safe compat stub binding; multi-distro glibc+musl x32 trigger regeneration is non-fatal and runtime falls back to compiled-in base data on stale/missing cache.
 - **Automatic Backend Registration**: `__attribute__((constructor))` automatically registers `nm_dl_backend_t` and `dbt_guest_invoker_cb` with [`newminhh/compat`](https://github.com/newminhh/compat).
 
 ---
